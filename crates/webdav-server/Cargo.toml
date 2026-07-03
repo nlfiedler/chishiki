@@ -9,8 +9,10 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Storage-engine crates (blobstore/chunker/vfs/index) and the WebDAV/HTTP stack
-# are wired in from Phase 2 onward as they are actually consumed.
+vfs.workspace = true
+dav-server.workspace = true
+axum.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

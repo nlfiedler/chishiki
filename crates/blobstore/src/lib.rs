@@ -32,7 +32,10 @@ use chunker::{ChunkerConfig, chunk_reader};
 use tempfile::NamedTempFile;
 
 /// A content-addressable blob store rooted at a directory.
-#[derive(Debug)]
+///
+/// Cloning is cheap (just the root path) and every clone addresses the same
+/// on-disk store, so a clone can be moved into a blocking task.
+#[derive(Debug, Clone)]
 pub struct BlobStore {
     root: PathBuf,
 }

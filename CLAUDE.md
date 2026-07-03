@@ -4,21 +4,35 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-**Rust** project, built as a **Cargo workspace**. Phases 0 (workspace & toolchain)
-and 1 (content-addressable blob store + FastCDC chunker) are complete; see
+**Rust** project, built as a **Cargo workspace**. Phases 0 (workspace &
+toolchain), 1 (content-addressable blob store + FastCDC chunker), and 2
+(virtualized filesystem + working WebDAV server) are complete; see
 `docs/specs/0001-initial-build-plan.md` for the phased plan.
 
 Layout:
 
 - `crates/blobstore` — content-addressable blob store; blake3-keyed blobs + FastCDC file manifests (Phase 1 ✓)
 - `crates/chunker` — FastCDC content-defined chunking (Phase 1 ✓)
-- `crates/vfs` — virtualized filesystem + versioned metadata, SQLite via `rusqlite` (Phases 2-3)
+- `crates/vfs` — virtualized filesystem: SQLite (`rusqlite`) metadata store + the `dav-server` `DavFileSystem`/`DavFile`/`DavMetaData` traits over the blob store (Phase 2 ✓; versioning in Phase 3)
 - `crates/index` — reverse index for search, `tantivy` (Phase 5)
-- `crates/webdav-server` — the WebDAV/HTTP binary; thin consumer of the above (Phases 2+)
+- `crates/webdav-server` — the WebDAV/HTTP binary; axum router in front of `dav-server`'s `DavHandler` + `MemLs`, backed by `vfs::DavFs` (Phase 2 ✓)
 
 The library crates are WebDAV-agnostic so the storage engine ships without
-dragging WebDAV along. Most crates are placeholders with smoke tests until their
-phase lands.
+dragging WebDAV along.
+
+**`vfs` design notes:** `DavFs` is `Clone` and holds an `Arc<Inner>` (SQLite
+`MetaStore` + `BlobStore` + chunker config). Each `DavFileSystem` method returns
+`async move { … }.boxed()`; SQLite metadata work runs synchronously (no `.await`
+while the connection mutex is held) so the futures stay `Send`, while the two
+file-size-proportional operations — reconstructing prior content on a
+non-truncating open, and chunking the temp file on `flush` — run on
+`tokio::task::spawn_blocking` so they don't stall the runtime. `dav-server` is
+used with `default-features = false` (no bundled `localfs`/`memfs`), so we map
+`io::Error`/`MetaError` to `FsError` ourselves (`io_to_fs`/`meta_to_fs`). Writes
+buffer to a temp file under `<data>/tmp` and are chunked into the blob store on
+`flush`; reads stream by reconstructing from the manifest (Range/seek supported,
+with the current chunk cached to keep sequential reads O(n)). Moving/copying a
+collection into its own subtree is rejected (`MetaStore::is_ancestor_or_self`).
 
 Toolchain is pinned by `rust-toolchain.toml` (Rust **1.96.0**, edition **2024**,
 with `rustfmt` + `clippy`).
@@ -26,7 +40,10 @@ with `rustfmt` + `clippy`).
 ### Commands
 
 - Build: `cargo build --workspace`
-- Run the server: `cargo run -p webdav-server`
+- Run the server: `cargo run -p webdav-server` (env: `CHISHIKI_DATA` — data dir,
+  default `./data`; `CHISHIKI_ADDR` — listen address, default `127.0.0.1:4918`).
+  Mount from a WebDAV client (`rclone`, `cadaver`, Finder, Windows) or drive with
+  `curl -X PROPFIND/PUT/GET/MKCOL/MOVE/COPY/DELETE`.
 - Test (all): `cargo test --workspace`
 - Test a single crate: `cargo test -p <crate>` (e.g. `cargo test -p blobstore`)
 - Test a single test by name: `cargo test -p <crate> <test_name>`

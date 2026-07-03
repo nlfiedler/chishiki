@@ -44,6 +44,15 @@ index = { path = "crates/index" }
 blake3 = "1"
 fastcdc = "3"
 tempfile = "3"
+# default-features off drops the built-in localfs/memfs backends (and their
+# libc/lru/parking_lot/reflink deps); we supply our own backend but still get
+# DavHandler, MemLs/FakeLs, the fs traits, and DavPath.
+dav-server = { version = "0.11", default-features = false }
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+bytes = "1"
+futures-util = "0.3"
 
 [profile.release]
 lto = "thin"

@@ -9,6 +9,15 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+blobstore.workspace = true
+chunker.workspace = true
+dav-server.workspace = true
+rusqlite.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+tempfile.workspace = true
+# For spawn_blocking: file-size-proportional blob work runs off the async worker.
+tokio.workspace = true
 
 [lints]
 workspace = true
