@@ -1,0 +1,16 @@
+[package]
+name = "webdav-server"
+description = "WebDAV/HTTP server: thin consumer of the storage engine crates."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Storage-engine crates (blobstore/chunker/vfs/index) and the WebDAV/HTTP stack
+# are wired in from Phase 2 onward as they are actually consumed.
+
+[lints]
+workspace = true

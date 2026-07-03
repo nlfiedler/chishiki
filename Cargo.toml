@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/blobstore",
+    "crates/chunker",
+    "crates/vfs",
+    "crates/index",
+    "crates/webdav-server",
+]
+
+# Settings shared by every crate in the workspace. Individual crates opt in with
+# `edition.workspace = true`, `version.workspace = true`, etc. in their manifests.
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+authors = ["Nathan Fiedler <nathanfiedler@fastmail.fm>"]
+repository = "https://github.com/nlfiedler/chishiki"
+
+# Shared lint configuration. Crates opt in with `[lints] workspace = true`.
+# Levels are set to `warn` here; CI escalates them to hard errors by passing
+# `-D warnings` to `cargo clippy`, so day-to-day local builds stay unblocked
+# while CI enforces a clean tree.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Dependencies shared across crates are declared here and referenced from member
+# manifests with `<dep>.workspace = true`, keeping versions in lockstep. Concrete
+# dependencies are added as each phase needs them.
+[workspace.dependencies]
+blobstore = { path = "crates/blobstore" }
+chunker = { path = "crates/chunker" }
+vfs = { path = "crates/vfs" }
+index = { path = "crates/index" }
+
+[profile.release]
+lto = "thin"

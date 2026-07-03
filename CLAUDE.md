@@ -4,7 +4,36 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-This is a **greenfield project**: the repository currently contains only `README.md`. There is no source code, build system, test suite, or chosen implementation language yet, and it is not a git repository. Do not assume any tooling exists — when starting implementation, establish the language/build/test toolchain first, then document the concrete commands here (build, lint, run, single-test).
+**Rust** project, built as a **Cargo workspace**. Phase 0 (workspace & toolchain)
+is complete; see `docs/specs/0001-initial-build-plan.md` for the phased plan.
+
+Layout:
+
+- `crates/blobstore` — content-addressable blob store (Phase 1)
+- `crates/chunker` — FastCDC content-defined chunking (Phase 1)
+- `crates/vfs` — virtualized filesystem + versioned metadata, SQLite via `rusqlite` (Phases 2-3)
+- `crates/index` — reverse index for search, `tantivy` (Phase 5)
+- `crates/webdav-server` — the WebDAV/HTTP binary; thin consumer of the above (Phases 2+)
+
+The library crates are WebDAV-agnostic so the storage engine ships without
+dragging WebDAV along. Most crates are placeholders with smoke tests until their
+phase lands.
+
+Toolchain is pinned by `rust-toolchain.toml` (Rust **1.96.0**, edition **2024**,
+with `rustfmt` + `clippy`).
+
+### Commands
+
+- Build: `cargo build --workspace`
+- Run the server: `cargo run -p webdav-server`
+- Test (all): `cargo test --workspace`
+- Test a single crate: `cargo test -p <crate>` (e.g. `cargo test -p blobstore`)
+- Test a single test by name: `cargo test -p <crate> <test_name>`
+- Format: `cargo fmt --all` (check-only: `cargo fmt --all --check`)
+- Lint: `cargo clippy --workspace --all-targets -- -D warnings`
+
+CI (`.github/workflows/ci.yml`) runs fmt-check, clippy (warnings denied), tests,
+doc-tests, and a release build on every push/PR to `main`.
 
 ## What is being built
 

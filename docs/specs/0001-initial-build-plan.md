@@ -1,7 +1,7 @@
 # 0001 — Initial Build Plan
 
-Status: Draft
-Date: 2026-07-01
+Status: Accepted
+Date: 2026-07-02
 
 Phased plan for building the WebDAV server in Rust on top of the `dav-server`
 crate. See `README.md` for project goals and `CLAUDE.md` for the standing
@@ -60,8 +60,7 @@ without dragging WebDAV along.
 
 ### Phase 2 — Virtualized filesystem + `DavFileSystem` (lib: `vfs`, bin: `webdav-server`)
 - Metadata store mapping the virtual path namespace → file manifests + attributes.
-  **Decision point:** embedded engine — lean `redb` or `sqlite` (rusqlite) for
-  queryability; `sled` is an option.
+  **Engine: SQLite via `rusqlite`** (see Open decisions #1).
 - Implement `DavFileSystem`/`DavFile`/`DavMetaData`/`DavDirEntry` over blob store
   + metadata.
 - Stand up `DavHandler` + `MemLs`, serve via axum. **Milestone:** mount from
@@ -69,13 +68,14 @@ without dragging WebDAV along.
   checkpoint).
 
 ### Phase 3 — Versioning (in `vfs`)
-- Every `PUT`/modify creates a new immutable version; near-free because unchanged
+- **Basic auto-versioning first** (see Open decisions #3): every `PUT`/modify
+  creates a new immutable version automatically; near-free because unchanged
   chunks are shared. Model version history in the metadata store.
-- Expose history pragmatically first — a virtual `.versions/` namespace and/or an
-  HTTP endpoint — since `dav-server` won't route Delta-V methods. **Full RFC 3253
-  protocol compliance (`VERSION-CONTROL`, `REPORT`, `CHECKOUT`/`CHECKIN`) is a
-  stretch goal** handled in the outer router if protocol-level Delta-V is needed
-  rather than just "I can get old versions."
+- Expose history pragmatically — a virtual `.versions/` namespace and/or an
+  HTTP endpoint — since `dav-server` won't route Delta-V methods.
+- **Full RFC 3253 protocol compliance (`VERSION-CONTROL`, `REPORT`,
+  `CHECKOUT`/`CHECKIN`) is deferred to later phases**, layered onto the outer
+  router incrementally once basic auto-versioning is solid.
 
 ### Phase 4 — Browser layer / content negotiation (in the router)
 - Detect browser vs. WebDAV client by `Accept: text/html`. `GET` `.md` → HTML via
@@ -84,9 +84,8 @@ without dragging WebDAV along.
   seeking). Realizes the "Browser vs. WebDAV client" section in `CLAUDE.md`.
 
 ### Phase 5 — Search / reverse index (lib: `index`)
-- On write, tokenize text/markdown and update a reverse index. **Decision point:**
-  `tantivy` (full-featured) vs. a hand-rolled inverted index (lighter, more
-  reusable, no big dep).
+- On write, tokenize text/markdown and update a reverse index. **Engine:
+  `tantivy`** (see Open decisions #2).
 - Two surfaces: browser-facing `GET /search?q=…`, and a `SEARCH`-method
   interceptor in the router for RFC 5323 clients.
 
@@ -95,8 +94,14 @@ without dragging WebDAV along.
   concurrency correctness, large-file streaming, integration tests against real
   WebDAV clients, and benchmarks.
 
-## Open decisions
-1. **Metadata engine** (Phase 2): `redb` vs. `sqlite`/rusqlite vs. `sled`.
-2. **Search engine** (Phase 5): `tantivy` vs. hand-rolled inverted index.
-3. **Versioning scope** (Phase 3): pragmatic version access vs. full Delta-V
-   protocol compliance.
+## Resolved decisions
+1. **Metadata engine** (Phase 2): **SQLite via `rusqlite`.** `sled` has had very
+   slow development for several years; `redb` looks promising but its own README
+   comparison shows a notably larger on-disk file size than SQLite. SQLite is a
+   very reliable, battle-tested storage library, so it wins.
+   _Resolved 2026-07-02._
+2. **Search engine** (Phase 5): **`tantivy`.** Full-featured and promising; worth
+   the dependency over a hand-rolled inverted index. _Resolved 2026-07-02._
+3. **Versioning scope** (Phase 3): **Basic auto-versioning first**, with
+   additional Delta-V (RFC 3253) protocol functionality delivered in later phases.
+   _Resolved 2026-07-02._

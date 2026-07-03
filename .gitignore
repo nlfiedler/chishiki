@@ -1,0 +1,8 @@
+# Rust build artifacts
+/target/
+
+# Backwards-compat: crate-local target dirs (should not appear with a workspace)
+**/target/
+
+# macOS
+.DS_Store
