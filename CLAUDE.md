@@ -4,13 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-**Rust** project, built as a **Cargo workspace**. Phase 0 (workspace & toolchain)
-is complete; see `docs/specs/0001-initial-build-plan.md` for the phased plan.
+**Rust** project, built as a **Cargo workspace**. Phases 0 (workspace & toolchain)
+and 1 (content-addressable blob store + FastCDC chunker) are complete; see
+`docs/specs/0001-initial-build-plan.md` for the phased plan.
 
 Layout:
 
-- `crates/blobstore` — content-addressable blob store (Phase 1)
-- `crates/chunker` — FastCDC content-defined chunking (Phase 1)
+- `crates/blobstore` — content-addressable blob store; blake3-keyed blobs + FastCDC file manifests (Phase 1 ✓)
+- `crates/chunker` — FastCDC content-defined chunking (Phase 1 ✓)
 - `crates/vfs` — virtualized filesystem + versioned metadata, SQLite via `rusqlite` (Phases 2-3)
 - `crates/index` — reverse index for search, `tantivy` (Phase 5)
 - `crates/webdav-server` — the WebDAV/HTTP binary; thin consumer of the above (Phases 2+)

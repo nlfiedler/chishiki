@@ -34,10 +34,16 @@ all = { level = "warn", priority = -1 }
 # manifests with `<dep>.workspace = true`, keeping versions in lockstep. Concrete
 # dependencies are added as each phase needs them.
 [workspace.dependencies]
+# Internal crates (path dependencies).
 blobstore = { path = "crates/blobstore" }
 chunker = { path = "crates/chunker" }
 vfs = { path = "crates/vfs" }
 index = { path = "crates/index" }
+
+# Third-party crates, versions pinned once for the whole workspace.
+blake3 = "1"
+fastcdc = "3"
+tempfile = "3"
 
 [profile.release]
 lto = "thin"

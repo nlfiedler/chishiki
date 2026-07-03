@@ -9,6 +9,9 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+chunker.workspace = true
+blake3.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
