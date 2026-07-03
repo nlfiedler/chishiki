@@ -24,3 +24,4 @@ Objective of the project is to build a personal storage server that is accessibl
 * [WebDAV Search](https://www.rfc-editor.org/rfc/rfc5323)
 * http://www.webdav.org
 * https://en.wikipedia.org/wiki/WebDAV
+* https://github.com/fstanis/awesome-webdav
