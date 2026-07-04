@@ -5,17 +5,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project status
 
 **Rust** project, built as a **Cargo workspace**. Phases 0 (workspace &
-toolchain), 1 (content-addressable blob store + FastCDC chunker), and 2
-(virtualized filesystem + working WebDAV server) are complete; see
+toolchain), 1 (content-addressable blob store + FastCDC chunker), 2 (virtualized
+filesystem + working WebDAV server), and 3 (auto-versioning) are complete; see
 `docs/specs/0001-initial-build-plan.md` for the phased plan.
 
 Layout:
 
 - `crates/blobstore` — content-addressable blob store; blake3-keyed blobs + FastCDC file manifests (Phase 1 ✓)
 - `crates/chunker` — FastCDC content-defined chunking (Phase 1 ✓)
-- `crates/vfs` — virtualized filesystem: SQLite (`rusqlite`) metadata store + the `dav-server` `DavFileSystem`/`DavFile`/`DavMetaData` traits over the blob store (Phase 2 ✓; versioning in Phase 3)
+- `crates/vfs` — virtualized filesystem: SQLite (`rusqlite`) metadata store with immutable per-file version history, + the `dav-server` `DavFileSystem`/`DavFile`/`DavMetaData` traits over the blob store (Phases 2–3 ✓)
 - `crates/index` — reverse index for search, `tantivy` (Phase 5)
-- `crates/webdav-server` — the WebDAV/HTTP binary; axum router in front of `dav-server`'s `DavHandler` + `MemLs`, backed by `vfs::DavFs` (Phase 2 ✓)
+- `crates/webdav-server` — the WebDAV/HTTP binary; axum router in front of `dav-server`'s `DavHandler` + `MemLs`, backed by `vfs::DavFs`, plus version-history endpoints (Phases 2–3 ✓)
 
 The library crates are WebDAV-agnostic so the storage engine ships without
 dragging WebDAV along.
@@ -33,6 +33,30 @@ buffer to a temp file under `<data>/tmp` and are chunked into the blob store on
 `flush`; reads stream by reconstructing from the manifest (Range/seek supported,
 with the current chunk cached to keep sequential reads O(n)). Moving/copying a
 collection into its own subtree is rejected (`MetaStore::is_ancestor_or_self`).
+
+**Versioning (Phase 3):** every content write appends an immutable version
+(`versions` + `version_chunks` tables; `nodes.current_version_id` points at the
+live one), unless the new content is byte-identical to the current version (then
+it's a no-op, so repeated no-op re-PUTs don't grow history). Overwriting a file
+via **PUT** appends a version to that same node, preserving its history.
+GET/PROPFIND serve the current version; history is
+exposed by the router (not `dav-server`) as `GET /path?versions` (JSON list) and
+`GET /path?version=N` (that version's bytes; a malformed selector is a 400). Full
+RFC 3253 Delta-V protocol is a later phase.
+
+Known Phase-3 limitations (deferred, not bugs):
+- `DavFs::read_version` reconstructs a historical version **into memory**, capped
+  at `MAX_IN_MEMORY_VERSION` (256 MiB → 413 above that). **TODO:** replace with an
+  owned streaming reader shared with the live GET path so any-size history streams.
+- Version history is reachable only via these `GET` endpoints, so a WebDAV-mounted
+  client (Finder/rclone) can't browse it. A virtual `.versions/` namespace or
+  Delta-V would close that gap.
+- **COPY/MOVE onto an existing file loses that file's history.** dav-server's
+  handler deletes the destination (cascading its versions) *before* calling
+  `fs.copy`/`fs.rename`, so overwrite-via-COPY/MOVE can't preserve history the way
+  PUT does. `DavFs::copy` already does the right thing for direct callers; closing
+  the HTTP gap needs the router to intercept COPY/MOVE (like the version endpoints)
+  or path-keyed history.
 
 Toolchain is pinned by `rust-toolchain.toml` (Rust **1.96.0**, edition **2024**,
 with `rustfmt` + `clippy`).
@@ -76,7 +100,7 @@ The interplay between these three (virtualized namespace ↔ content-addressed c
 
 WebDAV is an extension of HTTP: a WebDAV server *is* an HTTP server that adds extra methods (`PROPFIND`, `PROPPATCH`, `MKCOL`, `COPY`, `MOVE`, `LOCK`, `UNLOCK`, and `SEARCH` from RFC 5323) on top of `GET`/`PUT`/`DELETE`. This project serves **two kinds of clients over the same URLs**, and the split shapes the request-handling design:
 
-- **Browsers** only issue plain HTTP verbs (effectively `GET`). They have no UI for the WebDAV methods, so they are **read-only** here: they can view content and follow links, but cannot upload, move, list collections via `PROPFIND`, read version history, or run a WebDAV `SEARCH`.
+- **Browsers** only issue plain HTTP verbs (effectively `GET`). They have no UI for the WebDAV methods, so they are **read-only** here: they can view content and follow links, but cannot upload, move, or list collections via `PROPFIND`. They *can* read version history and (later) run search through server-provided `GET` endpoints (e.g. `?versions`, `?version=N`) — those are read-only `GET` surfaces the server adds precisely because browsers can't drive the WebDAV/Delta-V methods. Running a WebDAV `SEARCH` (the RFC 5323 method) remains WebDAV-only; a browser search box would likewise be a server `GET` endpoint.
 - **WebDAV clients** (Finder, Windows "Map network drive", `cadaver`, `rclone`, etc.) speak the full method set and drive uploads, versioning, and search.
 
 The mechanism that makes one namespace serve both is **content negotiation on `GET`** — inspect the request (e.g. `Accept: text/html`, which browsers send and WebDAV clients generally do not) and choose the representation:

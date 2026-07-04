@@ -5,8 +5,10 @@
 //! blob work without ever holding a lock across an `.await`, so the returned
 //! future stays `Send`.
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use blobstore::BlobStore;
 use chunker::ChunkerConfig;
@@ -77,6 +79,73 @@ impl DavFs {
             .lookup_path(&segments(path))
             .map_err(meta_to_fs)
     }
+
+    /// Resolve `path` to a file node (not a collection), for the version APIs.
+    fn resolve_file(&self, path: &DavPath) -> Result<Node, VfsError> {
+        let node = self.inner.meta.lookup_path(&segments(path))?;
+        if node.is_dir {
+            return Err(VfsError::Meta(MetaError::IsADirectory));
+        }
+        Ok(node)
+    }
+
+    /// List the version history of the file at `path`, oldest first.
+    ///
+    /// This is the read side of auto-versioning, surfaced to the outer HTTP
+    /// router (`dav-server` does not route Delta-V methods).
+    pub fn list_versions(&self, path: &DavPath) -> Result<Vec<VersionInfo>, VfsError> {
+        let node = self.resolve_file(path)?;
+        let versions = self.inner.meta.list_versions(node.id)?;
+        Ok(versions
+            .into_iter()
+            .map(|v| VersionInfo {
+                number: v.number,
+                size: v.size,
+                created: v.created,
+                is_current: Some(v.id) == node.current_version_id,
+            })
+            .collect())
+    }
+
+    /// Read the full content of a specific version (by 1-based number) of the
+    /// file at `path`.
+    ///
+    /// The version is reconstructed **into memory**, so it is capped at
+    /// [`MAX_IN_MEMORY_VERSION`]; larger historical versions return
+    /// [`VfsError::TooLarge`].
+    // TODO(phase-later): replace this with an owned streaming reader shared with
+    // the live GET path (`FileHandle`), so historical versions of any size stream
+    // chunk-by-chunk instead of being buffered.
+    pub fn read_version(&self, path: &DavPath, number: u64) -> Result<Vec<u8>, VfsError> {
+        let node = self.resolve_file(path)?;
+        let version = self.inner.meta.version_by_number(node.id, number)?;
+        if version.size > MAX_IN_MEMORY_VERSION {
+            return Err(VfsError::TooLarge(version.size));
+        }
+        let manifest = self.inner.meta.load_version_manifest(version.id)?;
+        let mut reader = self.inner.blobs.open_file(&manifest);
+        let mut buf = Vec::with_capacity(version.size as usize);
+        reader.read_to_end(&mut buf).map_err(VfsError::Io)?;
+        Ok(buf)
+    }
+}
+
+/// Upper bound on a historical version served in memory by [`DavFs::read_version`]
+/// (256 MiB). Guards against OOM until history streaming lands.
+pub const MAX_IN_MEMORY_VERSION: u64 = 256 * 1024 * 1024;
+
+/// A single entry in a file's version history, as surfaced by
+/// [`DavFs::list_versions`].
+#[derive(Debug, Clone)]
+pub struct VersionInfo {
+    /// 1-based version number (1 = oldest).
+    pub number: u64,
+    /// Size in bytes of this version.
+    pub size: u64,
+    /// When this version was written.
+    pub created: SystemTime,
+    /// Whether this is the file's current content.
+    pub is_current: bool,
 }
 
 impl DavFileSystem for DavFs {
@@ -316,51 +385,61 @@ impl DavFileSystem for DavFs {
                 return Err(FsError::Forbidden);
             }
 
-            // Remove an existing destination of the same node kind first.
-            if let Some(existing) = self
+            // A destination of a different node kind is a conflict.
+            let existing = self
                 .inner
                 .meta
                 .lookup_child(to_parent.id, to_name)
-                .map_err(meta_to_fs)?
+                .map_err(meta_to_fs)?;
+            if let Some(ref e) = existing
+                && e.is_dir != src.is_dir
             {
-                match (existing.is_dir, src.is_dir) {
-                    (false, false) => self
-                        .inner
-                        .meta
-                        .remove_file(existing.id)
-                        .map_err(meta_to_fs)?,
-                    (true, true) => {} // copy into the existing collection
-                    _ => return Err(FsError::Exists),
-                }
+                return Err(FsError::Exists);
             }
 
             if src.is_dir {
-                // Shallow copy: create the collection. dav-server drives recursion
-                // by walking children and issuing further copy/create_dir calls.
-                if self
-                    .inner
-                    .meta
-                    .lookup_child(to_parent.id, to_name)
-                    .map_err(meta_to_fs)?
-                    .is_none()
-                {
+                // Shallow copy: create the collection if absent (dav-server drives
+                // recursion by walking children and issuing further copy calls).
+                if existing.is_none() {
                     self.inner
                         .meta
                         .create_dir(to_parent.id, to_name)
                         .map_err(meta_to_fs)?;
                 }
             } else {
-                // Copying a file just points a new node at the same (shared) chunks.
-                let manifest = self.inner.meta.load_manifest(src.id).map_err(meta_to_fs)?;
-                let dst = self
-                    .inner
-                    .meta
-                    .create_file(to_parent.id, to_name)
-                    .map_err(meta_to_fs)?;
-                self.inner
-                    .meta
-                    .set_file_content(dst.id, &manifest)
-                    .map_err(meta_to_fs)?;
+                // Overwrite an existing destination file *in place* (reusing its
+                // node) so its version history is preserved — consistent with a
+                // PUT to the same path. Only a genuinely new file is created.
+                //
+                // NOTE: over HTTP this reuse path is not reached on overwrite,
+                // because dav-server's COPY/MOVE handler deletes the destination
+                // (cascading its versions) *before* calling us. So an HTTP COPY/MOVE
+                // onto an existing file still loses that file's history today;
+                // closing that gap needs the router to intercept COPY/MOVE (like the
+                // version endpoints) or path-keyed history. This branch keeps the
+                // fs-level operation correct for direct callers and future use.
+                let dst_existed = existing.is_some();
+                let dst_id = match existing {
+                    Some(e) => e.id,
+                    None => {
+                        self.inner
+                            .meta
+                            .create_file(to_parent.id, to_name)
+                            .map_err(meta_to_fs)?
+                            .id
+                    }
+                };
+                // Skip writing a version only when copying an unwritten (empty)
+                // source onto a brand-new destination — both are then empty, and
+                // we avoid creating a spurious empty version. Otherwise mirror the
+                // source's current content (shared chunks make this cheap).
+                if src.current_version_id.is_some() || dst_existed {
+                    let manifest = self.inner.meta.load_manifest(src.id).map_err(meta_to_fs)?;
+                    self.inner
+                        .meta
+                        .set_file_content(dst_id, &manifest)
+                        .map_err(meta_to_fs)?;
+                }
             }
             Ok(())
         }
@@ -431,13 +510,16 @@ pub(crate) fn meta_to_fs(e: MetaError) -> FsError {
     }
 }
 
-/// Error constructing a [`DavFs`].
+/// Error from [`DavFs`] construction and the version APIs.
 #[derive(Debug)]
 pub enum VfsError {
     /// Filesystem I/O error while setting up the data directory or blob store.
     Io(std::io::Error),
     /// Metadata-store error.
     Meta(MetaError),
+    /// A historical version was too large to reconstruct in memory (its size in
+    /// bytes); see [`DavFs::read_version`] and [`MAX_IN_MEMORY_VERSION`].
+    TooLarge(u64),
 }
 
 impl std::fmt::Display for VfsError {
@@ -445,7 +527,20 @@ impl std::fmt::Display for VfsError {
         match self {
             Self::Io(e) => write!(f, "i/o error: {e}"),
             Self::Meta(e) => write!(f, "metadata error: {e}"),
+            Self::TooLarge(n) => write!(f, "version too large to serve in memory: {n} bytes"),
         }
+    }
+}
+
+impl VfsError {
+    /// Whether this error is a "not found" (so the router can return 404).
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, VfsError::Meta(MetaError::NotFound))
+    }
+
+    /// Whether this error is "too large" (so the router can return 413).
+    pub fn is_too_large(&self) -> bool {
+        matches!(self, VfsError::TooLarge(_))
     }
 }
 
@@ -660,5 +755,99 @@ mod tests {
             fs.copy(&dp("/a"), &dp("/a/b/dup")).await.unwrap_err(),
             FsError::Forbidden
         );
+    }
+
+    #[tokio::test]
+    async fn versions_accumulate_and_old_content_is_retrievable() {
+        let (_dir, fs) = temp_fs();
+        write_file(&fs, "/doc.md", b"# version one").await;
+        write_file(&fs, "/doc.md", b"# version two, longer").await;
+
+        let versions = fs.list_versions(&dp("/doc.md")).unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].number, 1);
+        assert!(!versions[0].is_current);
+        assert_eq!(versions[1].number, 2);
+        assert!(versions[1].is_current);
+
+        assert_eq!(
+            fs.read_version(&dp("/doc.md"), 1).unwrap(),
+            b"# version one"
+        );
+        assert_eq!(
+            fs.read_version(&dp("/doc.md"), 2).unwrap(),
+            b"# version two, longer"
+        );
+        // The GET path serves the current (latest) version.
+        assert_eq!(read_file(&fs, "/doc.md").await, b"# version two, longer");
+    }
+
+    #[tokio::test]
+    async fn versions_of_missing_or_unwritten_paths() {
+        let (_dir, fs) = temp_fs();
+        assert!(fs.list_versions(&dp("/nope")).unwrap_err().is_not_found());
+
+        // A directory has no versions.
+        fs.create_dir(&dp("/d")).await.unwrap();
+        assert!(fs.list_versions(&dp("/d")).is_err());
+
+        // Requesting a non-existent version number is not found.
+        write_file(&fs, "/f", b"data").await;
+        assert!(fs.read_version(&dp("/f"), 5).unwrap_err().is_not_found());
+    }
+
+    #[tokio::test]
+    async fn identical_rewrite_creates_no_new_version() {
+        let (_dir, fs) = temp_fs();
+        write_file(&fs, "/f", b"same bytes").await;
+        write_file(&fs, "/f", b"same bytes").await; // no-op
+        write_file(&fs, "/f", b"same bytes").await; // no-op
+        assert_eq!(fs.list_versions(&dp("/f")).unwrap().len(), 1);
+
+        // A genuine change still appends.
+        write_file(&fs, "/f", b"different bytes").await;
+        assert_eq!(fs.list_versions(&dp("/f")).unwrap().len(), 2);
+    }
+
+    // NOTE: this drives `fs.copy` directly. Over HTTP, dav-server's COPY handler
+    // deletes the destination before calling us, so an HTTP COPY onto an existing
+    // file does NOT yet preserve history (see the note in `copy`). This test pins
+    // the fs-level behavior, which a future router-level COPY interceptor would use.
+    #[tokio::test]
+    async fn fs_copy_over_existing_file_preserves_its_history() {
+        let (_dir, fs) = temp_fs();
+        write_file(&fs, "/dst", b"dst one").await;
+        write_file(&fs, "/dst", b"dst two").await; // /dst has 2 versions
+        write_file(&fs, "/src", b"src content").await;
+
+        fs.copy(&dp("/src"), &dp("/dst")).await.unwrap();
+
+        // /dst keeps its history and gains the copied content as the latest version.
+        let versions = fs.list_versions(&dp("/dst")).unwrap();
+        assert_eq!(versions.len(), 3);
+        assert_eq!(fs.read_version(&dp("/dst"), 1).unwrap(), b"dst one");
+        assert_eq!(fs.read_version(&dp("/dst"), 2).unwrap(), b"dst two");
+        assert_eq!(read_file(&fs, "/dst").await, b"src content");
+    }
+
+    #[tokio::test]
+    async fn copy_of_unwritten_file_creates_no_spurious_version() {
+        let (_dir, fs) = temp_fs();
+        // Create a file but never write content (current version stays None).
+        let opts = OpenOptions {
+            write: true,
+            create: true,
+            ..Default::default()
+        };
+        fs.open(&dp("/empty"), opts)
+            .await
+            .unwrap()
+            .flush()
+            .await
+            .unwrap();
+        assert!(fs.list_versions(&dp("/empty")).unwrap().is_empty());
+
+        fs.copy(&dp("/empty"), &dp("/empty_copy")).await.unwrap();
+        assert!(fs.list_versions(&dp("/empty_copy")).unwrap().is_empty());
     }
 }

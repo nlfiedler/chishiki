@@ -12,5 +12,5 @@ mod file;
 pub mod meta;
 mod metadata;
 
-pub use davfs::{DavFs, VfsError};
-pub use meta::{MetaError, MetaStore, Node, ROOT_ID};
+pub use davfs::{DavFs, MAX_IN_MEMORY_VERSION, VersionInfo, VfsError};
+pub use meta::{MetaError, MetaStore, Node, ROOT_ID, Version};
