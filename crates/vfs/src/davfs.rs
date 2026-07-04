@@ -150,6 +150,73 @@ impl DavFs {
         reader.read_to_end(&mut buf).map_err(VfsError::Io)?;
         Ok(buf)
     }
+
+    /// Whether the node at `path` is a collection. Errors if `path` doesn't exist.
+    ///
+    /// Cheaper than [`list_dir`](Self::list_dir) (no child fetch); used to decide
+    /// the trailing-slash redirect before listing.
+    pub fn is_dir(&self, path: &DavPath) -> Result<bool, VfsError> {
+        Ok(self.inner.meta.lookup_path(&segments(path))?.is_dir)
+    }
+
+    /// List the entries of the collection at `path`, ordered by name, for the
+    /// browser directory index.
+    pub fn list_dir(&self, path: &DavPath) -> Result<Vec<DirEntryInfo>, VfsError> {
+        let node = self.inner.meta.lookup_path(&segments(path))?;
+        if !node.is_dir {
+            return Err(VfsError::Meta(MetaError::NotADirectory));
+        }
+        Ok(self
+            .inner
+            .meta
+            .children(node.id)?
+            .into_iter()
+            .map(|n| DirEntryInfo {
+                name: String::from_utf8_lossy(&n.name).into_owned(),
+                is_dir: n.is_dir,
+                size: n.size,
+                modified: n.modified,
+            })
+            .collect())
+    }
+
+    /// Revert the file at `path` to the content of version `number` by appending
+    /// it as a new version.
+    ///
+    /// Non-destructive: history is preserved and the reverted content becomes the
+    /// new current version. Cheap — the chunks are shared with the old version and
+    /// nothing is copied. (Reverting to content identical to current is a no-op,
+    /// since [`MetaStore::set_file_content`] deduplicates.)
+    pub fn revert_to_version(&self, path: &DavPath, number: u64) -> Result<(), VfsError> {
+        let node = self.resolve_file(path)?;
+        let version = self.inner.meta.version_by_number(node.id, number)?;
+        let manifest = self.inner.meta.load_version_manifest(version.id)?;
+        self.inner.meta.set_file_content(node.id, &manifest)?;
+        Ok(())
+    }
+
+    /// Delete a specific (non-current) historical version of the file at `path`.
+    ///
+    /// This frees version metadata only; the referenced chunk blobs remain until
+    /// chunk GC (Phase 6). See [`MetaStore::delete_version`].
+    pub fn prune_version(&self, path: &DavPath, number: u64) -> Result<(), VfsError> {
+        let node = self.resolve_file(path)?;
+        self.inner.meta.delete_version(node.id, number)?;
+        Ok(())
+    }
+}
+
+/// One entry in a directory listing, as surfaced by [`DavFs::list_dir`].
+#[derive(Debug, Clone)]
+pub struct DirEntryInfo {
+    /// Entry name (lossily decoded to UTF-8 for display).
+    pub name: String,
+    /// Whether the entry is a collection.
+    pub is_dir: bool,
+    /// File size in bytes (0 for collections).
+    pub size: u64,
+    /// Last-modified time.
+    pub modified: SystemTime,
 }
 
 /// Upper bound on a historical version served in memory by [`DavFs::read_version`]
@@ -525,9 +592,10 @@ pub(crate) fn meta_to_fs(e: MetaError) -> FsError {
     match e {
         MetaError::NotFound => FsError::NotFound,
         MetaError::Exists => FsError::Exists,
-        MetaError::NotEmpty | MetaError::NotADirectory | MetaError::IsADirectory => {
-            FsError::Forbidden
-        }
+        MetaError::NotEmpty
+        | MetaError::NotADirectory
+        | MetaError::IsADirectory
+        | MetaError::CurrentVersion => FsError::Forbidden,
         MetaError::Corrupt | MetaError::Sqlite(_) => FsError::GeneralFailure,
     }
 }
@@ -892,5 +960,66 @@ mod tests {
 
         fs.copy(&dp("/empty"), &dp("/empty_copy")).await.unwrap();
         assert!(fs.list_versions(&dp("/empty_copy")).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_dir_reports_entries() {
+        let (_dir, fs) = temp_fs();
+        fs.create_dir(&dp("/d")).await.unwrap();
+        write_file(&fs, "/d/a.md", b"hello").await;
+        fs.create_dir(&dp("/d/sub")).await.unwrap();
+
+        let mut entries = fs.list_dir(&dp("/d")).unwrap();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "a.md");
+        assert!(!entries[0].is_dir);
+        assert_eq!(entries[0].size, 5);
+        assert_eq!(entries[1].name, "sub");
+        assert!(entries[1].is_dir);
+
+        // Listing a file (not a collection) errors.
+        assert!(fs.list_dir(&dp("/d/a.md")).is_err());
+    }
+
+    #[tokio::test]
+    async fn revert_appends_old_content_as_new_version() {
+        let (_dir, fs) = temp_fs();
+        write_file(&fs, "/f", b"one").await;
+        write_file(&fs, "/f", b"two").await;
+        write_file(&fs, "/f", b"three").await; // current = "three", 3 versions
+
+        fs.revert_to_version(&dp("/f"), 1).unwrap(); // back to "one"
+
+        let versions = fs.list_versions(&dp("/f")).unwrap();
+        assert_eq!(versions.len(), 4); // history preserved, revert appended
+        assert!(versions[3].is_current);
+        assert_eq!(read_file(&fs, "/f").await, b"one");
+        // The originals are still retrievable.
+        assert_eq!(fs.read_version(&dp("/f"), 2).unwrap(), b"two");
+    }
+
+    #[tokio::test]
+    async fn prune_deletes_noncurrent_but_refuses_current() {
+        let (_dir, fs) = temp_fs();
+        write_file(&fs, "/f", b"v1").await;
+        write_file(&fs, "/f", b"v2").await;
+        write_file(&fs, "/f", b"v3").await; // current = v3
+
+        // Delete an old version.
+        fs.prune_version(&dp("/f"), 1).unwrap();
+        let numbers: Vec<u64> = fs
+            .list_versions(&dp("/f"))
+            .unwrap()
+            .iter()
+            .map(|v| v.number)
+            .collect();
+        assert_eq!(numbers, vec![2, 3]);
+
+        // The current version can't be pruned; a missing one is not found.
+        assert!(fs.prune_version(&dp("/f"), 3).is_err());
+        assert!(fs.prune_version(&dp("/f"), 99).unwrap_err().is_not_found());
+        // Current content is intact.
+        assert_eq!(read_file(&fs, "/f").await, b"v3");
     }
 }

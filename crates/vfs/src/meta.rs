@@ -73,6 +73,8 @@ pub enum MetaError {
     NotADirectory,
     /// Expected a file but found a collection.
     IsADirectory,
+    /// Attempted to delete a file's current version.
+    CurrentVersion,
     /// Stored data could not be decoded (e.g. a malformed chunk hash).
     Corrupt,
 }
@@ -86,6 +88,7 @@ impl std::fmt::Display for MetaError {
             Self::NotEmpty => write!(f, "collection is not empty"),
             Self::NotADirectory => write!(f, "not a collection"),
             Self::IsADirectory => write!(f, "is a collection"),
+            Self::CurrentVersion => write!(f, "cannot delete the current version"),
             Self::Corrupt => write!(f, "corrupt metadata"),
         }
     }
@@ -381,6 +384,31 @@ impl MetaStore {
         )
         .optional()?
         .ok_or(MetaError::NotFound)
+    }
+
+    /// Delete a specific historical version of a file (and its chunk rows via
+    /// cascade). Refuses to delete the file's current version.
+    ///
+    /// Note: this frees version *metadata* only. The chunk blobs it referenced
+    /// remain in the content-addressable store until chunk GC (Phase 6) collects
+    /// those no longer referenced by any version.
+    pub fn delete_version(&self, node_id: i64, number: u64) -> Result<()> {
+        let conn = self.lock();
+        let row: Option<(i64, Option<i64>)> = conn
+            .query_row(
+                "SELECT v.id, n.current_version_id
+                     FROM versions v JOIN nodes n ON n.id = v.node_id
+                     WHERE v.node_id = ?1 AND v.number = ?2",
+                params![node_id, number as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (version_id, current) = row.ok_or(MetaError::NotFound)?;
+        if current == Some(version_id) {
+            return Err(MetaError::CurrentVersion);
+        }
+        conn.execute("DELETE FROM versions WHERE id = ?1", [version_id])?;
+        Ok(())
     }
 
     /// Delete a file node (and its chunk references via cascade).

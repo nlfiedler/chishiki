@@ -63,21 +63,28 @@ autoindex), per-file "view" pages, and any version writes.
 unsanitized. For a single-user personal server serving your own content this is
 acceptable; if the server ever becomes multi-user, sanitize rendered output.
 
-## Phase 4b — Version UX + richer pages (later, this doc's scope)
+## Phase 4b — Version UX + richer pages (implemented)
 
-1. **Our own directory index + per-file "view" page.** Replaces/augments the
-   built-in autoindex so listings and file pages can carry version controls and
-   embed media (`<img>`/`<video>`/rendered Markdown). Needs a
-   `DavFs::list_dir(path) -> Vec<{name, is_dir, size, modified}>` helper (a clean
-   public listing API rather than consuming the `DavDirEntry` stream).
-2. **Revert** — `DavFs::revert_to_version(path, n)`: **append a new version whose
-   manifest is version N's**. This fits the append-only, chunk-shared model
-   exactly: non-destructive (history preserved: …, vN, …, vM = "reverted to vN"),
-   O(1) metadata, no bytes copied. Preferred over repointing
-   `current_version_id`, which would break the "current == highest number"
-   invariant and the stability of `?version=N` identities.
-3. **Prune** — `DavFs::delete_versions(...)`: remove old `versions`/`version_chunks`
-   rows (never the current version). See the space-reclaim decision below.
+1. **Our own directory index** (`DavFs::list_dir(path) -> Vec<DirEntryInfo>`),
+   replacing the built-in autoindex so listings carry a per-file "history" link.
+   Entries link relatively (`name` / `name/` / `../`), so a `GET` on a collection
+   without a trailing slash 302-redirects to add one. (A per-file "view" page that
+   embeds media alongside version controls was **not** built — clicking a file
+   renders/downloads it directly, matching the FTP-like model; version management
+   lives on the `?versions` page.)
+2. **Revert** — `DavFs::revert_to_version(path, n)`: **appends a new version whose
+   manifest is version N's**. Fits the append-only, chunk-shared model exactly:
+   non-destructive (history preserved: …, vN, …, vM = "reverted to vN"), O(1)
+   metadata, no bytes copied. Chosen over repointing `current_version_id`, which
+   would break the "current == highest number" invariant and the stability of
+   `?version=N` identities.
+3. **Prune** — `DavFs::prune_version(path, n)` / `MetaStore::delete_version`: deletes
+   a non-current version's `versions`/`version_chunks` rows (refuses the current
+   version). See the space-reclaim decision below.
+
+The version-management surface is content-negotiated: browser `GET /file?versions`
+returns an HTML page (revert/delete buttons that `POST ?revert=N` / `?prune=N`,
+303-redirecting back); non-browsers get JSON. All HTML lives in the `web` module.
 
 ## Decisions
 
@@ -101,8 +108,7 @@ acceptable; if the server ever becomes multi-user, sanitize rendered output.
 5. **No schema change.** The Phase-3 `versions`/`version_chunks` model already
    supports revert (append) and prune (delete rows).
 
-## Open questions (revisit at 4b)
+## Resolved (at 4b)
 
-- Own index vs. keep leaning on the built-in autoindex once version controls are
-  needed (leaning: build our own).
-- Whether revert/prune live on a per-file view page or a dedicated history page.
+- Built our own directory index (autoindex off), for the per-file history link.
+- Revert/prune live on the per-file `?versions` history page (no separate view page).
