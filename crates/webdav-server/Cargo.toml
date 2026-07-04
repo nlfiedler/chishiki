@@ -13,6 +13,7 @@ vfs.workspace = true
 dav-server.workspace = true
 axum.workspace = true
 tokio.workspace = true
+pulldown-cmark.workspace = true
 
 [lints]
 workspace = true

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use blobstore::BlobStore;
+use blobstore::{BlobStore, Manifest};
 use chunker::ChunkerConfig;
 use dav_server::davpath::DavPath;
 use dav_server::fs::{
@@ -119,12 +119,34 @@ impl DavFs {
     pub fn read_version(&self, path: &DavPath, number: u64) -> Result<Vec<u8>, VfsError> {
         let node = self.resolve_file(path)?;
         let version = self.inner.meta.version_by_number(node.id, number)?;
-        if version.size > MAX_IN_MEMORY_VERSION {
-            return Err(VfsError::TooLarge(version.size));
-        }
         let manifest = self.inner.meta.load_version_manifest(version.id)?;
-        let mut reader = self.inner.blobs.open_file(&manifest);
-        let mut buf = Vec::with_capacity(version.size as usize);
+        self.reconstruct(&manifest, version.size, MAX_IN_MEMORY_VERSION)
+    }
+
+    /// Read the file's *current* content into memory, rejecting content larger
+    /// than `max_bytes` with [`VfsError::TooLarge`].
+    ///
+    /// The caller sets the cap so each use can bound memory appropriately — e.g.
+    /// the browser Markdown renderer uses a small cap, since a document is tiny
+    /// and this path is reachable by unauthenticated browser GETs.
+    pub fn read_current(&self, path: &DavPath, max_bytes: u64) -> Result<Vec<u8>, VfsError> {
+        let node = self.resolve_file(path)?;
+        let manifest = self.inner.meta.load_manifest(node.id)?;
+        self.reconstruct(&manifest, node.size, max_bytes)
+    }
+
+    /// Reconstruct a manifest's bytes into memory, rejecting content over `max_bytes`.
+    fn reconstruct(
+        &self,
+        manifest: &Manifest,
+        size: u64,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, VfsError> {
+        if size > max_bytes {
+            return Err(VfsError::TooLarge(size));
+        }
+        let mut reader = self.inner.blobs.open_file(manifest);
+        let mut buf = Vec::with_capacity(size as usize);
         reader.read_to_end(&mut buf).map_err(VfsError::Io)?;
         Ok(buf)
     }
@@ -828,6 +850,27 @@ mod tests {
         assert_eq!(fs.read_version(&dp("/dst"), 1).unwrap(), b"dst one");
         assert_eq!(fs.read_version(&dp("/dst"), 2).unwrap(), b"dst two");
         assert_eq!(read_file(&fs, "/dst").await, b"src content");
+    }
+
+    #[tokio::test]
+    async fn read_current_returns_latest_content() {
+        let (_dir, fs) = temp_fs();
+        write_file(&fs, "/doc.md", b"# first").await;
+        write_file(&fs, "/doc.md", b"# second (current)").await;
+        assert_eq!(
+            fs.read_current(&dp("/doc.md"), 1024).unwrap(),
+            b"# second (current)"
+        );
+
+        // Content over the cap is rejected.
+        assert!(matches!(
+            fs.read_current(&dp("/doc.md"), 4),
+            Err(VfsError::TooLarge(_))
+        ));
+
+        // A directory is not readable as a file.
+        fs.create_dir(&dp("/d")).await.unwrap();
+        assert!(fs.read_current(&dp("/d"), 1024).is_err());
     }
 
     #[tokio::test]
