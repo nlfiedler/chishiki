@@ -61,8 +61,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("chishiki webdav-server listening on http://{addr} (data dir: {data_dir})");
-    axum::serve(listener, app).await?;
+    // On Ctrl-C / SIGTERM, stop accepting connections and let in-flight requests
+    // finish before exiting. Completed writes are already durable (fsync'd blobs +
+    // committed SQLite transactions); this drains in-progress ones and lets temp
+    // files be cleaned up.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+/// Resolve once the process receives an interrupt (Ctrl-C) or, on Unix, `SIGTERM`.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+    println!("\nshutting down; waiting for in-flight requests to finish…");
 }
 
 /// Dispatch a request. Browser `GET`s (directory index, version pages, rendered
