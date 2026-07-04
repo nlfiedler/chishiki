@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "blobstore"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "blake3",
  "chunker",
@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "chunker"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "fastcdc",
 ]
@@ -679,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "index"
-version = "0.0.0"
+version = "0.4.0"
 
 [[package]]
 name = "itoa"
@@ -1251,7 +1251,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vfs"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "blobstore",
  "bytes",
@@ -1316,7 +1316,7 @@ dependencies = [
 
 [[package]]
 name = "webdav-server"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "dav-server",
