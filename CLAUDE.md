@@ -7,9 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Rust** project, built as a **Cargo workspace**. Phases 0 (workspace &
 toolchain), 1 (content-addressable blob store + FastCDC chunker), 2 (virtualized
 filesystem + working WebDAV server), and 3 (auto-versioning) are complete, and
-Phase 4 (browser web interface) has landed. See
-`docs/specs/0001-initial-build-plan.md` for the phased plan and
-`docs/specs/0002-web-interface.md` for the web-interface design.
+Phase 4 (browser web interface, incl. a two-pane Bulma UI) has landed. See
+`docs/specs/0001-initial-build-plan.md` for the phased plan, and
+`docs/specs/0002-web-interface.md` + `docs/specs/0003-web-ui.md` for the
+web-interface design.
 
 Layout:
 
@@ -60,19 +61,31 @@ Known Phase-3 limitations (deferred, not bugs):
   the HTTP gap needs the router to intercept COPY/MOVE (like the version endpoints)
   or path-keyed history.
 
-**Browser layer (Phase 4).** `dav-server` supplies the basics for free: it sets
-`Content-Type` by extension (images/video render inline, with range/seek). On top,
-the router does content negotiation for browser `GET`s (those whose `Accept`
-includes `text/html`), with all HTML built in the `web` module:
-- **Directory** → our own version-aware index (`DavFs::list_dir`; the built-in
-  autoindex is off). A `GET` on a collection without a trailing slash 302-redirects
-  to add one so relative entry links resolve.
-- **`*.md`** → rendered to HTML via `pulldown-cmark` (`DavFs::read_current`, capped
-  at `MAX_MARKDOWN_BYTES`; oversized → 413).
-- **`?versions`** → an HTML version page with revert/delete controls for browsers,
-  JSON otherwise. `?version=N` → that version's bytes.
-- Anything else (missing file, non-HTML client, other file types) falls through to
-  the `DavHandler` → raw bytes, so WebDAV clients are unaffected.
+**Browser layer (Phase 4).** A **two-pane web UI** (fixed left sidebar +
+scrolling main pane, styled with **Bulma**, embedded and served at
+`/_assets/bulma.css`). All HTML lives in the `web` module (pure data→String
+functions); the router owns dispatch. `dav-server` provides `Content-Type` by
+extension and range/seek for the raw bytes underneath.
+- **Sidebar** — breadcrumb of the current path + the current directory's entries
+  (`DavFs::list_dir` / `is_dir`; built-in autoindex is off). For a file URL the
+  sidebar shows the parent directory with the file highlighted.
+- **Directory** → main pane renders a `README.md`/`index.md` if present, else an
+  index table. A collection GET without a trailing slash 302-redirects (relative).
+- **File** → main pane by `web::file_kind`: Markdown rendered via `pulldown-cmark`,
+  text/source shown escaped in a `<pre>`, `<img>`/`<video>`/`<audio>` media, a PDF
+  `<iframe>`, else a download prompt (all reads capped at `MAX_PREVIEW_BYTES`).
+  `.svg`/`.html` are deliberately *not* inline-viewable (served inline they run
+  same-origin script — accepted single-user risk, hardened in Phase 6; see 0003).
+- **`?raw`** → the view/bytes split: a browser navigation gets the view page,
+  while `<img src="?raw">` / `<video>` / the Download link fetch the **raw bytes**
+  (falls through to the `DavHandler`, streamed with range support).
+- **`?versions`** → the version page inside the shell (revert/delete controls) for
+  browsers, JSON otherwise. `?version=N` → that version's bytes.
+- Not everything is `Accept`-negotiated: `?raw` and the directory page are served
+  regardless of `Accept` (a collection's only GET representation is its index);
+  only file *rendering* is gated on `Accept: text/html`. Other non-`text/html`
+  requests fall through to the `DavHandler` for raw bytes. Shell links are absolute
+  (no reverse-proxy sub-path yet; see `docs/specs/0003-web-ui.md`).
 
 **Version management** is browser-initiated *write*, exposed only via **`POST`**
 (never `GET`): `POST /file?revert=N` (`DavFs::revert_to_version` — appends version

@@ -4,10 +4,11 @@
 //! [`vfs::DavFs`] (SQLite metadata + content-addressable blob store). Phase 2
 //! stands up a working WebDAV class-1/2 server; Phase 3 adds auto-versioning with
 //! a version-history HTTP surface here in the router (`dav-server` does not route
-//! Delta-V methods). Phase 4 adds the browser layer: our own directory index,
-//! per-file version pages with revert/prune, and Markdown rendering by content
-//! negotiation. SEARCH (Phase 5) is layered on later. See
-//! `docs/specs/0001-initial-build-plan.md` and `docs/specs/0002-web-interface.md`.
+//! Delta-V methods). Phase 4 adds the browser layer: a two-pane web UI (sidebar +
+//! main pane, styled with Bulma) with directory browsing, file rendering (Markdown
+//! /image/video via the `?raw` view/bytes split), and per-file version pages with
+//! revert/prune. SEARCH (Phase 5) is layered on later. See the specs under
+//! `docs/specs/` (0001 build plan, 0002 web interface, 0003 web UI).
 //!
 //! Content mutations (upload/move/delete) remain WebDAV-only; the browser gets
 //! read-only browsing plus the explicit version-management writes (revert/prune).
@@ -20,12 +21,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::Request;
 use axum::http::{Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::any;
+use axum::routing::{any, get};
 use axum::{Extension, Router};
 use dav_server::DavHandler;
 use dav_server::davpath::DavPath;
 use dav_server::memls::MemLs;
-use vfs::{DavFs, DirEntryInfo, VersionInfo};
+use vfs::{DavFs, VersionInfo};
 
 /// Directory that holds the blob store, metadata database, and upload staging.
 const DEFAULT_DATA_DIR: &str = "./data";
@@ -54,6 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The whole namespace is served at the root. `/` handles the root collection;
     // `/{*path}` (axum 0.8 wildcard syntax) handles everything below it.
     let app = Router::new()
+        // Reserved prefix for embedded server assets (takes precedence over the
+        // namespace wildcard). Shadows a real node literally named `_assets`.
+        .route("/_assets/bulma.css", get(serve_bulma))
         .route("/", any(handle))
         .route("/{*path}", any(handle))
         .layer(Extension(dav))
@@ -96,9 +100,21 @@ async fn shutdown_signal() {
     println!("\nshutting down; waiting for in-flight requests to finish…");
 }
 
-/// Dispatch a request. Browser `GET`s (directory index, version pages, rendered
-/// Markdown) and version-mutating `POST`s are handled here; everything else —
-/// including WebDAV methods and raw file `GET`s — is passed to the `DavHandler`.
+/// Serve the embedded Bulma stylesheet (cached aggressively — it never changes).
+async fn serve_bulma() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        web::BULMA_CSS,
+    )
+        .into_response()
+}
+
+/// Dispatch a request. Browser `GET`s (directory / file / version pages) and
+/// version-mutating `POST`s are handled here; everything else — including WebDAV
+/// methods and raw file `GET`s — is passed to the `DavHandler`.
 async fn handle(
     Extension(dav): Extension<DavHandler>,
     Extension(fs): Extension<DavFs>,
@@ -130,9 +146,14 @@ async fn handle_browser_get(
     query: &str,
     accept_html: bool,
 ) -> Option<Response> {
+    // `?raw` serves the underlying bytes (embedded media / downloads) — let the
+    // DavHandler stream them, with content-type and range support.
+    if has_raw(query) {
+        return None;
+    }
     match parse_version_query(query) {
         VersionRequest::Bad => Some(bad_request("invalid version selector")),
-        VersionRequest::List => Some(version_listing(fs, path_str, accept_html)),
+        VersionRequest::List => Some(version_page_response(fs, path_str, accept_html).await),
         VersionRequest::Version(number) => Some(match DavPath::new(path_str) {
             Ok(path) => serve_version(fs.clone(), path, number).await,
             Err(_) => bad_request("bad path"),
@@ -140,29 +161,57 @@ async fn handle_browser_get(
         VersionRequest::None => {
             let path = DavPath::new(path_str).ok()?;
             match fs.is_dir(&path) {
-                // A collection: our index is its only GET representation, so serve
-                // it to every client (not just browsers). Redirect to a trailing
-                // slash first so relative entry links resolve; the Location is
-                // relative (the last path segment) to stay correct behind a proxy.
-                Ok(true) => Some(if let Some(seg) = needs_trailing_slash(path_str) {
-                    redirect(StatusCode::FOUND, &format!("{seg}/"))
-                } else {
-                    match fs.list_dir(&path) {
-                        Ok(entries) => directory_response(&path, entries),
-                        Err(_) => return None,
-                    }
+                // A collection: its page is the only GET representation, so serve
+                // it to any client. Redirect to a trailing slash first so relative
+                // asset/links resolve; the Location is relative to stay correct
+                // behind a mount prefix.
+                Ok(true) => Some(match needs_trailing_slash(path_str) {
+                    Some(seg) => redirect(StatusCode::FOUND, &format!("{seg}/")),
+                    None => directory_page(fs, &path, path_str).await,
                 }),
-                // A file: render Markdown for browsers; otherwise fall through to
-                // the DavHandler (raw bytes with content-type).
-                Ok(false) if accept_html && is_markdown(path_str) => {
-                    render_markdown(fs, path).await
-                }
-                // A file for a non-HTML client, or a missing path → let the
-                // DavHandler serve the bytes / a 404.
+                // A file: the browser gets a view page; other clients fall through
+                // to the DavHandler for raw bytes.
+                Ok(false) if accept_html => Some(file_page(fs, &path, path_str).await),
                 _ => None,
             }
         }
     }
+}
+
+/// `GET /dir/` → the directory page: sidebar plus a rendered README (if present)
+/// or an index table in the main pane.
+async fn directory_page(fs: &DavFs, path: &DavPath, path_str: &str) -> Response {
+    let entries = match fs.list_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => return not_found(),
+    };
+    let dir_segments = decoded_segments(path);
+    let readme_html = match entries.iter().find(|e| !e.is_dir && is_readme(&e.name)) {
+        Some(entry) => match child_path(path_str, &entry.name) {
+            Some(readme) => read_inline(fs, readme, web::FileKind::Markdown).await,
+            None => None,
+        },
+        None => None,
+    };
+    let display = display_path(path);
+    let sidebar = web::sidebar(&dir_segments, &entries, None);
+    let main = web::dir_main(&display, readme_html.as_deref(), &dir_segments, &entries);
+    html_response(web::page(&display, &sidebar, &main))
+}
+
+/// `GET /file` (browser) → the file view page: sidebar of the parent directory
+/// plus the file's content (rendered Markdown / embedded media / download).
+async fn file_page(fs: &DavFs, path: &DavPath, path_str: &str) -> Response {
+    let name = basename(path);
+    let kind = web::file_kind(&name);
+    let content = if kind.reads_text() {
+        read_inline(fs, path.clone(), kind).await
+    } else {
+        None
+    };
+    let sidebar = parent_sidebar(fs, path_str, &name);
+    let main = web::file_main(&name, kind, content.as_deref());
+    html_response(web::page(&name, &sidebar, &main))
 }
 
 /// Handle a version-mutating `POST` (`?revert=N` / `?prune=N`). Returns `None` for
@@ -193,14 +242,18 @@ fn handle_post_action(fs: &DavFs, req: &Request) -> Option<Response> {
     })
 }
 
-/// `GET /path?versions` → the version history (HTML page for browsers, JSON otherwise).
-fn version_listing(fs: &DavFs, path_str: &str, accept_html: bool) -> Response {
+/// `GET /path?versions` → the version history: a page (in the shell) for browsers,
+/// JSON otherwise.
+async fn version_page_response(fs: &DavFs, path_str: &str, accept_html: bool) -> Response {
     let Ok(path) = DavPath::new(path_str) else {
         return bad_request("bad path");
     };
     match fs.list_versions(&path) {
         Ok(versions) if accept_html => {
-            html_response(web::version_page(&basename(&path), &versions))
+            let name = basename(&path);
+            let sidebar = parent_sidebar(fs, path_str, &name);
+            let main = web::version_main(&name, &versions);
+            html_response(web::page(&format!("Versions of {name}"), &sidebar, &main))
         }
         Ok(versions) => json_response(versions_to_json(&versions)),
         Err(e) if e.is_not_found() => not_found(),
@@ -208,19 +261,16 @@ fn version_listing(fs: &DavFs, path_str: &str, accept_html: bool) -> Response {
     }
 }
 
-/// `GET /dir/` → our HTML directory index.
-fn directory_response(path: &DavPath, entries: Vec<DirEntryInfo>) -> Response {
-    let display = {
-        let d = String::from_utf8_lossy(path.as_bytes());
-        if d.is_empty() {
-            "/".to_string()
-        } else {
-            d.into_owned()
+/// Sidebar showing the parent directory of `path_str`, highlighting `current_file`.
+fn parent_sidebar(fs: &DavFs, path_str: &str, current_file: &str) -> String {
+    match DavPath::new(&parent_encoded(path_str)) {
+        Ok(parent) => {
+            let segments = decoded_segments(&parent);
+            let entries = fs.list_dir(&parent).unwrap_or_default();
+            web::sidebar(&segments, &entries, Some(current_file))
         }
-    };
-    // The root has no parent to link to.
-    let has_parent = path.as_bytes().iter().any(|&b| b != b'/');
-    html_response(web::directory_index(&display, has_parent, &entries))
+        Err(_) => web::sidebar(&[], &[], Some(current_file)),
+    }
 }
 
 /// `GET /path?version=N` → the raw bytes of version N.
@@ -242,41 +292,33 @@ async fn serve_version(fs: DavFs, path: DavPath, number: u64) -> Response {
     }
 }
 
-/// Largest Markdown file we'll render in memory. A document is tiny; the cap
-/// bounds memory on this unauthenticated, per-request path (independent of the
-/// much larger version-history cap).
-const MAX_MARKDOWN_BYTES: u64 = 8 * 1024 * 1024;
+/// Largest file we'll read into memory to render inline (Markdown/text). A
+/// document is tiny; the cap bounds memory on this unauthenticated, per-request
+/// path (independent of the much larger version-history cap).
+const MAX_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Render the current content of a Markdown file to an HTML page.
-///
-/// Returns `None` — so the caller falls through to the `DavHandler` (raw bytes /
-/// 404) — when the path isn't a renderable file (missing or a read error). An
-/// oversized file yields 413 and a render panic yields 500, rather than silently
-/// serving raw bytes.
-async fn render_markdown(fs: &DavFs, path: DavPath) -> Option<Response> {
-    let title = basename(&path);
+/// Read a file's current content (capped) and produce the inline main-pane HTML
+/// fragment: rendered Markdown, or the raw text for a [`web::FileKind::Text`] file
+/// (which `file_main` escapes). `None` if it can't be read (missing, over
+/// [`MAX_PREVIEW_BYTES`], IO error, or a render panic) — the caller shows a
+/// download fallback instead.
+async fn read_inline(fs: &DavFs, path: DavPath, kind: web::FileKind) -> Option<String> {
     let fs = fs.clone();
     // Reading blobs + rendering is CPU/IO work; keep it off the async worker.
     let rendered = tokio::task::spawn_blocking(move || {
-        fs.read_current(&path, MAX_MARKDOWN_BYTES).map(|bytes| {
-            let markdown = String::from_utf8_lossy(&bytes);
-            web::markdown_page(&title, &markdown)
+        fs.read_current(&path, MAX_PREVIEW_BYTES).map(|bytes| {
+            let text = String::from_utf8_lossy(&bytes);
+            if kind == web::FileKind::Markdown {
+                web::markdown_to_html(&text)
+            } else {
+                text.into_owned()
+            }
         })
     })
     .await;
     match rendered {
-        Ok(Ok(html)) => Some(html_response(html)),
-        Ok(Err(e)) if e.is_too_large() => Some(
-            (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "markdown file too large to render",
-            )
-                .into_response(),
-        ),
-        // Missing file or an IO error → let the DavHandler serve it.
-        Ok(Err(_)) => None,
-        // The render task panicked.
-        Err(_) => Some((StatusCode::INTERNAL_SERVER_ERROR, "render failed").into_response()),
+        Ok(Ok(html)) => Some(html),
+        _ => None,
     }
 }
 
@@ -375,10 +417,16 @@ fn wants_html(req: &Request) -> bool {
         .is_some_and(|accept| accept.contains("text/html"))
 }
 
-/// Whether a request path names a Markdown file.
-fn is_markdown(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.ends_with(".md") || lower.ends_with(".markdown")
+/// Whether the query string carries the `raw` selector (serve underlying bytes).
+fn has_raw(query: &str) -> bool {
+    query
+        .split('&')
+        .any(|p| p == "raw" || p.starts_with("raw="))
+}
+
+/// Whether a name is a directory's index document (rendered into the main pane).
+fn is_readme(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "readme.md" | "index.md")
 }
 
 /// Last path segment (decoded), for page titles and links.
@@ -389,6 +437,50 @@ fn basename(path: &DavPath) -> String {
         .rfind(|s| !s.is_empty())
         .unwrap_or(b"");
     String::from_utf8_lossy(last).into_owned()
+}
+
+/// The decoded, non-empty path segments of a `DavPath` (e.g. `["docs", "a"]`).
+fn decoded_segments(path: &DavPath) -> Vec<String> {
+    path.as_bytes()
+        .split(|&b| b == b'/')
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
+}
+
+/// A file's decoded path for display (e.g. `/docs/a/`), defaulting to `/`.
+fn display_path(path: &DavPath) -> String {
+    let d = String::from_utf8_lossy(path.as_bytes());
+    if d.is_empty() {
+        "/".into()
+    } else {
+        d.into_owned()
+    }
+}
+
+/// The parent directory of an (already percent-encoded) request path, with a
+/// trailing slash (e.g. `/a/b/note.md` → `/a/b/`).
+fn parent_encoded(path_str: &str) -> String {
+    let trimmed = path_str.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(i) => path_str[..=i].to_string(),
+        None => "/".to_string(),
+    }
+}
+
+/// Build a child `DavPath` under an (encoded) parent path by appending an encoded
+/// segment for `name`.
+fn child_path(parent_encoded: &str, name: &str) -> Option<DavPath> {
+    let sep = if parent_encoded.ends_with('/') {
+        ""
+    } else {
+        "/"
+    };
+    DavPath::new(&format!(
+        "{parent_encoded}{sep}{}",
+        web::encode_segment(name)
+    ))
+    .ok()
 }
 
 /// Render version metadata as a JSON array. All fields are numeric/boolean, so no

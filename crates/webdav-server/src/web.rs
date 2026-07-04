@@ -1,109 +1,242 @@
-//! Server-generated HTML for the browser interface: directory index, per-file
-//! version-management page, and rendered Markdown. Pure functions that turn data
-//! into a self-contained HTML string; the router (`main.rs`) owns dispatch.
+//! Server-generated HTML for the two-pane browser UI, styled with Bulma.
 //!
-//! Links use relative/query-only hrefs so pages work regardless of mount prefix:
-//! a directory page (served at a trailing-slash URL) links to `name` / `name/`
-//! and `../`; a version page (at `…/file`) links to `?version=N`, and its
-//! revert/prune forms POST to `?revert=N` / `?prune=N`.
+//! Pure data→String functions; the router (`main.rs`) owns dispatch and I/O.
+//! Every page is the same shell — a fixed left sidebar (breadcrumb + the current
+//! directory's entries) and a scrolling main pane — so full-reload navigation
+//! feels like fixed panes. Links are absolute and percent-encoded (a mount
+//! sub-path behind a proxy is out of scope; see `docs/specs/0003-web-ui.md`).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use vfs::{DirEntryInfo, VersionInfo};
 
-/// Percent-encoding set for a single URL path segment: everything that isn't an
-/// unreserved character (RFC 3986 `A-Za-z0-9-._~`) is encoded, so a name is safe
-/// as one segment (spaces, `/`, `?`, `#`, … all encoded).
+/// Vendored Bulma, embedded so the server is self-contained (served at
+/// `/_assets/bulma.css`).
+pub(crate) const BULMA_CSS: &str = include_str!("../assets/bulma.min.css");
+
+/// Percent-encoding set for one URL path segment (everything but RFC 3986
+/// unreserved `A-Za-z0-9-._~`).
 const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
     .remove(b'.')
     .remove(b'~');
 
-/// Wrap rendered Markdown in a minimal, self-contained HTML document.
-///
-/// NOTE: `pulldown-cmark` passes raw HTML embedded in the Markdown through
-/// unsanitized. Fine for a single-user personal server serving your own content;
-/// sanitize if this ever becomes multi-user.
-pub(crate) fn markdown_page(title: &str, markdown: &str) -> String {
-    use pulldown_cmark::{Options, Parser, html};
+/// The kind of a file, chosen by extension, for main-pane rendering.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileKind {
+    Markdown,
+    /// Plain text / source shown escaped in a `<pre>`.
+    Text,
+    Image,
+    Video,
+    Audio,
+    Pdf,
+    Other,
+}
 
+impl FileKind {
+    /// Whether the router should read the file's text to render it inline.
+    pub(crate) fn reads_text(self) -> bool {
+        matches!(self, FileKind::Markdown | FileKind::Text)
+    }
+}
+
+/// Classify a file name by extension.
+///
+/// Note: `.svg`/`.html` are deliberately *not* inline-viewable kinds — served
+/// inline they can execute same-origin script (see `docs/specs/0003-web-ui.md`).
+pub(crate) fn file_kind(name: &str) -> FileKind {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "md" | "markdown" => FileKind::Markdown,
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "bmp" | "ico" => FileKind::Image,
+        "mp4" | "webm" | "mov" | "mkv" | "ogv" => FileKind::Video,
+        "mp3" | "wav" | "ogg" | "flac" | "m4a" | "aac" => FileKind::Audio,
+        "pdf" => FileKind::Pdf,
+        "txt" | "text" | "log" | "json" | "jsonc" | "csv" | "tsv" | "toml" | "yaml" | "yml"
+        | "xml" | "ini" | "conf" | "cfg" | "env" | "properties" | "diff" | "patch" | "rs"
+        | "py" | "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx" | "c" | "h" | "cpp" | "cc" | "hpp"
+        | "go" | "java" | "rb" | "sh" | "bash" | "zsh" | "sql" | "css" | "scss" | "lua" | "pl"
+        | "php" | "kt" | "swift" | "r" | "jl" | "hs" | "ml" | "ex" | "exs" => FileKind::Text,
+        _ => FileKind::Other,
+    }
+}
+
+/// Render Markdown to an HTML fragment (no surrounding page).
+///
+/// NOTE: raw HTML embedded in the Markdown is passed through unsanitized — fine
+/// for a single-user personal server; sanitize if this becomes multi-user.
+pub(crate) fn markdown_to_html(markdown: &str) -> String {
+    use pulldown_cmark::{Options, Parser, html};
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_FOOTNOTES;
     let parser = Parser::new_ext(markdown, options);
-    let mut body = String::new();
-    html::push_html(&mut body, parser);
+    let mut out = String::new();
+    html::push_html(&mut out, parser);
+    out
+}
 
-    page(
-        title,
-        &format!("<article class=\"markdown\">{body}</article>"),
+/// Assemble the full two-pane page from a prebuilt sidebar and main pane.
+pub(crate) fn page(title: &str, sidebar: &str, main: &str) -> String {
+    let title = escape_html(title);
+    format!(
+        "<!doctype html>\n\
+         <html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>{title}</title>\
+         <link rel=\"stylesheet\" href=\"/_assets/bulma.css\">\
+         <style>{CUSTOM_CSS}</style></head>\
+         <body><div class=\"app\">\
+         <aside class=\"app-sidebar\">{sidebar}</aside>\
+         <main class=\"app-main\">{main}</main>\
+         </div></body></html>"
     )
 }
 
-/// A directory listing. `display_path` is the decoded path for the heading;
-/// `has_parent` controls the `../` link; `entries` are the children.
-pub(crate) fn directory_index(
-    display_path: &str,
-    has_parent: bool,
+/// The sidebar: a breadcrumb of `dir_segments` (decoded path of the current
+/// directory) plus its `entries` (folders then files). `current_file`, if set,
+/// highlights the open file.
+pub(crate) fn sidebar(
+    dir_segments: &[String],
     entries: &[DirEntryInfo],
+    current_file: Option<&str>,
 ) -> String {
-    let mut rows = String::new();
-    if has_parent {
-        rows.push_str("<tr><td><a href=\"../\">../</a></td><td></td><td></td><td></td></tr>");
-    }
+    let mut folders = String::new();
+    let mut files = String::new();
     for entry in entries {
         let name = escape_html(&entry.name);
-        let seg = encode_segment(&entry.name);
+        if entry.is_dir {
+            let href = format!("{}/", file_href(dir_segments, &entry.name));
+            folders.push_str(&format!("<li><a href=\"{href}\">{name}/</a></li>"));
+        } else {
+            let href = file_href(dir_segments, &entry.name);
+            let active = if current_file == Some(entry.name.as_str()) {
+                " class=\"is-active\""
+            } else {
+                ""
+            };
+            files.push_str(&format!("<li><a{active} href=\"{href}\">{name}</a></li>"));
+        }
+    }
+
+    let mut menu = breadcrumb(dir_segments);
+    menu.push_str("<div class=\"menu\">");
+    if !folders.is_empty() {
+        menu.push_str(&format!(
+            "<p class=\"menu-label\">Folders</p><ul class=\"menu-list\">{folders}</ul>"
+        ));
+    }
+    if !files.is_empty() {
+        menu.push_str(&format!(
+            "<p class=\"menu-label\">Files</p><ul class=\"menu-list\">{files}</ul>"
+        ));
+    }
+    if folders.is_empty() && files.is_empty() {
+        menu.push_str("<p class=\"menu-label\">empty</p>");
+    }
+    menu.push_str("</div>");
+    menu
+}
+
+/// Directory main pane: a rendered `README` if present, else an index table.
+pub(crate) fn dir_main(
+    display_path: &str,
+    readme_html: Option<&str>,
+    dir_segments: &[String],
+    entries: &[DirEntryInfo],
+) -> String {
+    if let Some(html) = readme_html {
+        return format!("<div class=\"content\">{html}</div>");
+    }
+    let mut rows = String::new();
+    for entry in entries {
+        let name = escape_html(&entry.name);
         let modified = escape_html(&format_time(entry.modified));
         if entry.is_dir {
+            let href = format!("{}/", file_href(dir_segments, &entry.name));
             rows.push_str(&format!(
-                "<tr><td><a href=\"{seg}/\">{name}/</a></td><td></td>\
-                 <td>{modified}</td><td></td></tr>"
+                "<tr><td><a href=\"{href}\">{name}/</a></td><td></td><td>{modified}</td><td></td></tr>"
             ));
         } else {
+            let href = file_href(dir_segments, &entry.name);
             let size = format_size(entry.size);
             rows.push_str(&format!(
-                "<tr><td><a href=\"{seg}\">{name}</a></td><td>{size}</td>\
-                 <td>{modified}</td><td><a href=\"{seg}?versions\">history</a></td></tr>"
+                "<tr><td><a href=\"{href}\">{name}</a></td><td>{size}</td><td>{modified}</td>\
+                 <td><a href=\"{href}?versions\">history</a></td></tr>"
             ));
         }
     }
     let heading = escape_html(display_path);
-    let body = format!(
-        "<h1>Index of {heading}</h1>\
-         <table><thead><tr><th>Name</th><th>Size</th><th>Modified</th><th></th></tr></thead>\
-         <tbody>{rows}</tbody></table>"
-    );
-    page(&format!("Index of {display_path}"), &body)
+    format!(
+        "<h1 class=\"title is-5\">Index of {heading}</h1>\
+         <table class=\"table is-fullwidth is-hoverable\"><thead><tr>\
+         <th>Name</th><th>Size</th><th>Modified</th><th></th></tr></thead><tbody>{rows}</tbody></table>"
+    )
 }
 
-/// A file's version-management page: history plus revert/prune controls.
+/// File main pane: a header (name + Download/History) over the content, which is
+/// rendered Markdown, escaped text, embedded media, or a download prompt.
 ///
-/// `file_name` is the decoded basename (for display and the "view current" link).
-/// `versions` is oldest-first; the page shows newest-first.
-pub(crate) fn version_page(file_name: &str, versions: &[VersionInfo]) -> String {
-    let name = escape_html(file_name);
-    let seg = encode_segment(file_name);
+/// For [`FileKind::Markdown`] `text` is the *rendered* HTML fragment; for
+/// [`FileKind::Text`] it is the raw file content (escaped here). Other kinds
+/// ignore `text`.
+pub(crate) fn file_main(name: &str, kind: FileKind, text: Option<&str>) -> String {
+    let body = match kind {
+        FileKind::Markdown => match text {
+            Some(html) => format!("<div class=\"content\">{html}</div>"),
+            None => no_preview(),
+        },
+        FileKind::Text => match text {
+            Some(content) => format!("<pre>{}</pre>", escape_html(content)),
+            None => no_preview(),
+        },
+        FileKind::Image => {
+            "<figure class=\"image\"><img src=\"?raw\" alt=\"\"></figure>".to_string()
+        }
+        FileKind::Video => {
+            "<video controls style=\"max-width:100%\"><source src=\"?raw\"></video>".to_string()
+        }
+        FileKind::Audio => "<audio controls src=\"?raw\" style=\"width:100%\"></audio>".to_string(),
+        FileKind::Pdf => {
+            "<iframe src=\"?raw\" title=\"PDF\" style=\"width:100%;height:82vh;border:0\"></iframe>"
+                .to_string()
+        }
+        FileKind::Other => no_preview(),
+    };
+    format!("{}{body}", file_header(name))
+}
 
+/// "No preview" notice with a nudge to the Download button.
+fn no_preview() -> String {
+    "<p class=\"notification\">No inline preview for this file — use Download above.</p>"
+        .to_string()
+}
+
+/// Version-history main pane: the table with view/revert/delete controls.
+pub(crate) fn version_main(name: &str, versions: &[VersionInfo]) -> String {
     let mut rows = String::new();
     for v in versions.iter().rev() {
         let created = escape_html(&format_time(v.created));
         let size = format_size(v.size);
         let marker = if v.is_current {
-            " <span class=\"tag\">current</span>"
+            " <span class=\"tag is-success is-light\">current</span>"
         } else {
             ""
         };
-        // Query-only hrefs/actions keep the same path (…/file).
-        let mut actions = format!("<a href=\"?version={}\">view</a>", v.number);
+        let mut actions = format!(
+            "<a class=\"button is-small\" href=\"?version={}\">view</a>",
+            v.number
+        );
         if !v.is_current {
             actions.push_str(&format!(
-                " <form method=\"post\" action=\"?revert={n}\"><button>revert to</button></form>\
+                " <form method=\"post\" action=\"?revert={n}\">\
+                 <button class=\"button is-small\">revert to</button></form>\
                  <form method=\"post\" action=\"?prune={n}\">\
-                 <button class=\"danger\">delete</button></form>",
+                 <button class=\"button is-small is-danger is-light\">delete</button></form>",
                 n = v.number
             ));
         }
@@ -113,33 +246,74 @@ pub(crate) fn version_page(file_name: &str, versions: &[VersionInfo]) -> String 
             v.number
         ));
     }
-
-    let body = format!(
-        "<h1>Versions of {name}</h1>\
-         <p class=\"links\"><a href=\"./\">↑ directory</a> · \
-         <a href=\"{seg}\">view current</a></p>\
-         <p class=\"note\">Deleting a version removes it from history but does not \
-         reclaim disk space until garbage collection (a later phase).</p>\
-         <table><thead><tr><th>Version</th><th>Size</th><th>Created</th><th>Actions</th></tr>\
-         </thead><tbody>{rows}</tbody></table>"
-    );
-    page(&format!("Versions of {file_name}"), &body)
-}
-
-/// Wrap page `body` in a minimal HTML document with the shared stylesheet.
-fn page(title: &str, body: &str) -> String {
-    let title = escape_html(title);
+    // A relative basename href drops the `?versions` query, landing on the file's
+    // rendered view page (not the raw bytes).
+    let view_href = encode_segment(name);
+    let name = escape_html(name);
     format!(
-        "<!doctype html>\n\
-         <html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>{title}</title><style>{PAGE_CSS}</style></head>\
-         <body><main>{body}</main></body></html>"
+        "<h1 class=\"title is-5\">Versions of {name}</h1>\
+         <p class=\"buttons\"><a class=\"button is-small\" href=\"{view_href}\">view current</a></p>\
+         <p class=\"notification is-warning is-light\">Deleting a version removes it from \
+         history but does not reclaim disk space until garbage collection (a later phase).</p>\
+         <table class=\"table is-fullwidth\"><thead><tr>\
+         <th>Version</th><th>Size</th><th>Created</th><th>Actions</th></tr></thead>\
+         <tbody>{rows}</tbody></table>"
     )
 }
 
-/// Percent-encode a name for use as one URL path segment.
-fn encode_segment(name: &str) -> String {
+/// Header bar for a file's main pane: the name plus Download/History links.
+fn file_header(name: &str) -> String {
+    let name = escape_html(name);
+    format!(
+        "<div class=\"level\"><div class=\"level-left\">\
+         <h1 class=\"title is-5\">{name}</h1></div>\
+         <div class=\"level-right buttons\">\
+         <a class=\"button is-small\" href=\"?raw\" download>Download</a>\
+         <a class=\"button is-small\" href=\"?versions\">History</a></div></div>"
+    )
+}
+
+/// Breadcrumb `<nav>` for the current directory's decoded segments.
+fn breadcrumb(dir_segments: &[String]) -> String {
+    let mut items = String::from("<li><a href=\"/\">home</a></li>");
+    for i in 0..dir_segments.len() {
+        let href = format!("{}/", dir_href(&dir_segments[..=i]));
+        let label = escape_html(&dir_segments[i]);
+        let active = if i + 1 == dir_segments.len() {
+            " class=\"is-active\""
+        } else {
+            ""
+        };
+        items.push_str(&format!("<li{active}><a href=\"{href}\">{label}</a></li>"));
+    }
+    format!("<nav class=\"breadcrumb is-small\"><ul>{items}</ul></nav>")
+}
+
+/// Absolute, percent-encoded href for a directory given its decoded segments
+/// (without a trailing slash — callers append `/` as needed).
+fn dir_href(segments: &[String]) -> String {
+    let mut href = String::new();
+    for seg in segments {
+        href.push('/');
+        href.push_str(&encode_segment(seg));
+    }
+    if href.is_empty() {
+        href.push('/');
+    }
+    href
+}
+
+/// Absolute, percent-encoded href for a file `name` within `dir_segments`.
+fn file_href(dir_segments: &[String], name: &str) -> String {
+    let base = dir_href(dir_segments);
+    if base.ends_with('/') {
+        format!("{base}{}", encode_segment(name))
+    } else {
+        format!("{base}/{}", encode_segment(name))
+    }
+}
+
+pub(crate) fn encode_segment(name: &str) -> String {
     utf8_percent_encode(name, SEGMENT).to_string()
 }
 
@@ -187,44 +361,31 @@ fn format_time(t: SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02} {h:02}:{m:02}:{s:02} UTC")
 }
 
-/// Convert days-since-Unix-epoch to a (year, month, day) civil date.
-///
-/// Howard Hinnant's `civil_from_days` algorithm (public domain), valid for the
-/// proleptic Gregorian calendar.
+/// Days-since-Unix-epoch → (year, month, day). Howard Hinnant's `civil_from_days`
+/// (public domain), proleptic Gregorian.
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
-/// Minimal readable stylesheet shared by all server-generated pages.
-const PAGE_CSS: &str = "\
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;\
-line-height:1.6;color:#1a1a1a;background:#fff;margin:0}\
-main{max-width:52rem;margin:2rem auto;padding:0 1.25rem}\
-h1{line-height:1.25;font-size:1.5rem}\
-a{color:#0366d6;text-decoration:none}a:hover{text-decoration:underline}\
-table{border-collapse:collapse;width:100%}\
-th,td{text-align:left;padding:.35em .75em;border-bottom:1px solid #eee}\
-th{border-bottom:2px solid #ddd;font-size:.85em;color:#555}\
-td.actions{white-space:nowrap}\
-form{display:inline;margin:0 0 0 .5em}\
-button{font:inherit;cursor:pointer;background:#f5f5f5;border:1px solid #ccc;\
-border-radius:5px;padding:.1em .6em}button:hover{background:#eaeaea}\
-button.danger{color:#b00}\
-.tag{font-size:.75em;background:#e6f4ea;color:#137333;border-radius:4px;padding:.05em .4em}\
-.note{color:#555;font-size:.9em;background:#fffbe6;border:1px solid #f0e0a0;\
-border-radius:6px;padding:.5em .75em}\
-.links{color:#555}\
-article.markdown pre{background:#f5f5f5;padding:1rem;overflow:auto;border-radius:6px}\
-article.markdown code{background:#f5f5f5;padding:.15em .35em;border-radius:4px;font-size:.9em}\
-article.markdown pre code{background:none;padding:0}\
-article.markdown img{max-width:100%}\
-article.markdown blockquote{margin:0;padding-left:1rem;border-left:4px solid #ddd;color:#555}";
+/// Custom layout CSS appended to Bulma: fixed sidebar + scrolling main.
+const CUSTOM_CSS: &str = "\
+html,body{height:100%}\
+.app{display:flex;height:100vh}\
+.app-sidebar{width:20rem;min-width:15rem;max-width:24rem;overflow:auto;\
+padding:1rem 1rem 2rem;border-right:1px solid #e5e5e5;background:#fbfbfb}\
+.app-main{flex:1;overflow:auto;padding:1.5rem 2rem}\
+.app-sidebar .breadcrumb{margin-bottom:1rem}\
+.app-sidebar .menu-label{margin-top:1rem}\
+.app-main .actions form{display:inline;margin-left:.35rem}\
+.app-main figure.image img{max-width:100%;height:auto}\
+@media(max-width:768px){.app{flex-direction:column;height:auto}\
+.app-sidebar{width:auto;max-width:none;border-right:none;border-bottom:1px solid #e5e5e5}}";
