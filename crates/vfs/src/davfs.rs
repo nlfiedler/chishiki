@@ -161,6 +161,11 @@ impl DavFs {
 
     /// List the entries of the collection at `path`, ordered by name, for the
     /// browser directory index.
+    ///
+    /// Dot-prefixed entries (`.DS_Store`, AppleDouble `._*`, `.git`, …) are
+    /// omitted — they're hidden clutter in a browser listing. WebDAV clients still
+    /// see everything via `read_dir`/PROPFIND, so e.g. Finder keeps managing its
+    /// own metadata files.
     pub fn list_dir(&self, path: &DavPath) -> Result<Vec<DirEntryInfo>, VfsError> {
         let node = self.inner.meta.lookup_path(&segments(path))?;
         if !node.is_dir {
@@ -171,6 +176,7 @@ impl DavFs {
             .meta
             .children(node.id)?
             .into_iter()
+            .filter(|n| !n.name.starts_with(b"."))
             .map(|n| DirEntryInfo {
                 name: String::from_utf8_lossy(&n.name).into_owned(),
                 is_dir: n.is_dir,
@@ -980,6 +986,24 @@ mod tests {
 
         // Listing a file (not a collection) errors.
         assert!(fs.list_dir(&dp("/d/a.md")).is_err());
+    }
+
+    #[tokio::test]
+    async fn list_dir_hides_dot_prefixed_entries() {
+        let (_dir, fs) = temp_fs();
+        write_file(&fs, "/visible.md", b"hi").await;
+        write_file(&fs, "/.DS_Store", b"junk").await;
+        write_file(&fs, "/._.DS_Store", b"junk").await;
+        write_file(&fs, "/._visible.md", b"junk").await;
+        fs.create_dir(&dp("/.hidden")).await.unwrap();
+
+        // The browser listing shows only the non-dot entry.
+        let entries = fs.list_dir(&dp("/")).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["visible.md"]);
+
+        // But the hidden files still exist and are reachable (WebDAV visibility).
+        assert!(fs.metadata(&dp("/.DS_Store")).await.is_ok());
     }
 
     #[tokio::test]
