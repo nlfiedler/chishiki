@@ -377,15 +377,20 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 /// Custom layout CSS appended to Bulma: fixed sidebar + scrolling main.
+// Colors reference Bulma's scheme CSS variables so the layout follows Bulma's
+// automatic light/dark mode (`prefers-color-scheme`) instead of hardcoding light
+// values — otherwise the sidebar stays light while the rest goes dark.
 const CUSTOM_CSS: &str = "\
 html,body{height:100%}\
 .app{display:flex;height:100vh}\
 .app-sidebar{width:20rem;min-width:15rem;max-width:24rem;overflow:auto;\
-padding:1rem 1rem 2rem;border-right:1px solid #e5e5e5;background:#fbfbfb}\
-.app-main{flex:1;overflow:auto;padding:1.5rem 2rem}\
+padding:1rem 1rem 2rem;border-right:1px solid var(--bulma-border);\
+background:var(--bulma-scheme-main-bis)}\
+.app-main{flex:1;overflow:auto;padding:1.5rem 2rem;background:var(--bulma-scheme-main)}\
 .app-sidebar .breadcrumb{margin-bottom:1rem}\
 .app-sidebar .menu-label{margin-top:1rem}\
 .app-main .actions form{display:inline;margin-left:.35rem}\
 .app-main figure.image img{max-width:100%;height:auto}\
 @media(max-width:768px){.app{flex-direction:column;height:auto}\
-.app-sidebar{width:auto;max-width:none;border-right:none;border-bottom:1px solid #e5e5e5}}";
+.app-sidebar{width:auto;max-width:none;border-right:none;\
+border-bottom:1px solid var(--bulma-border)}}";
