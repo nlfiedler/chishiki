@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 blobstore.workspace = true
 chunker.workspace = true
+index.workspace = true
 dav-server.workspace = true
 rusqlite.workspace = true
 bytes.workspace = true

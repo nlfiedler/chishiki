@@ -19,6 +19,7 @@ use dav_server::fs::{
 };
 use futures_util::future::FutureExt;
 use futures_util::stream::{self, StreamExt};
+use index::SearchIndex;
 
 use crate::file::FileHandle;
 use crate::meta::{MetaError, MetaStore, Node, ROOT_ID};
@@ -29,8 +30,139 @@ pub(crate) struct Inner {
     pub(crate) meta: MetaStore,
     pub(crate) blobs: BlobStore,
     pub(crate) chunker: ChunkerConfig,
+    /// Full-text reverse index over indexable file content (Phase 5).
+    pub(crate) index: SearchIndex,
     /// Directory for in-progress upload temp files.
     pub(crate) tmp_dir: PathBuf,
+}
+
+/// Largest file content we tokenize into the search index. A text document is
+/// tiny; the cap avoids reading a large mislabeled file into memory to index.
+const MAX_INDEX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Candidate pool fetched from the index before scope filtering (see
+/// [`DavFs::search`]). Bounds the work of a scoped query while being generous
+/// enough that in-scope matches are rarely cut before filtering.
+const MAX_SEARCH_FETCH: usize = 1000;
+
+/// Whether `path` names a file strictly inside the collection at `prefix`
+/// (`prefix` followed by a `/` boundary), so `/docs` matches `/docs/a` but not
+/// `/docsX/a`. Both are absolute virtual paths from [`MetaStore::path_of`].
+fn is_within(path: &[u8], prefix: &[u8]) -> bool {
+    path.len() > prefix.len() && path.starts_with(prefix) && path[prefix.len()] == b'/'
+}
+
+impl Inner {
+    /// Bring the search index in sync with a node's current content.
+    ///
+    /// Indexes the (capped) content of a text file, or drops a document a text
+    /// file had while it was smaller than the cap. A node that was never a
+    /// candidate for indexing (a directory, a binary/non-text name, or a file
+    /// with no content) is left untouched — a node's name is fixed except via
+    /// rename (which doesn't reindex), so such a node can hold no stale document,
+    /// and skipping it avoids a needless index commit per binary-media upload.
+    ///
+    /// Best-effort: the metadata/blob store is the source of truth and the index
+    /// is derived, so a failure is logged rather than propagated (it would
+    /// otherwise fail a write whose content is already durably stored).
+    pub(crate) fn reindex(&self, node_id: i64) {
+        if let Err(e) = self.try_reindex(node_id) {
+            eprintln!("chishiki: search index update failed for node {node_id}: {e}");
+        }
+    }
+
+    fn try_reindex(&self, node_id: i64) -> Result<(), VfsError> {
+        let node = self.meta.get_node(node_id)?;
+        // Only a text file that currently has content is ever indexed.
+        let is_text_file =
+            !node.is_dir && node.current_version_id.is_some() && is_indexable_name(&node.name);
+        if !is_text_file {
+            // Never a candidate → nothing was ever indexed for it. Skip entirely
+            // (no delete, no commit) so binary/media writes don't fsync the index.
+            return Ok(());
+        }
+        if node.size > MAX_INDEX_BYTES {
+            // A text file that grew past the cap: drop any document it had while
+            // small so its stale content stops matching.
+            self.index.remove_document(node_id as u64)?;
+            self.index.commit()?;
+            return Ok(());
+        }
+        let manifest = self.meta.load_manifest(node_id)?;
+        let mut reader = self.blobs.open_file(&manifest);
+        let mut buf = Vec::with_capacity(node.size as usize);
+        reader.read_to_end(&mut buf).map_err(VfsError::Io)?;
+        let text = String::from_utf8_lossy(&buf);
+        self.index.index_document(node_id as u64, &text)?;
+        self.index.commit()?;
+        Ok(())
+    }
+
+    /// Remove a node's document from the search index (best-effort, logged).
+    fn deindex(&self, node_id: i64) {
+        if let Err(e) = self
+            .index
+            .remove_document(node_id as u64)
+            .and_then(|()| self.index.commit())
+        {
+            eprintln!("chishiki: search index removal failed for node {node_id}: {e}");
+        }
+    }
+}
+
+/// Whether a file name looks like indexable text (by extension). Binary media
+/// (images, video, audio, archives) is deliberately excluded — only textual
+/// documents are tokenized into the reverse index.
+fn is_indexable_name(name: &[u8]) -> bool {
+    // Dot-prefixed names (`.DS_Store`, AppleDouble `._*`, dotfiles) are never
+    // indexed — they're hidden from the browser listing and would only pollute
+    // search. This also rejects a name that is *only* an extension (e.g. `.md`).
+    if name.first() == Some(&b'.') {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    let ext = match lower.rsplit(|&b| b == b'.').next() {
+        // A name with no extension isn't indexed.
+        Some(e) if e.len() < lower.len() && !e.is_empty() => e,
+        _ => return false,
+    };
+    matches!(
+        ext,
+        b"md"
+            | b"markdown"
+            | b"txt"
+            | b"text"
+            | b"log"
+            | b"rst"
+            | b"org"
+            | b"tex"
+            | b"json"
+            | b"csv"
+            | b"tsv"
+            | b"toml"
+            | b"yaml"
+            | b"yml"
+            | b"xml"
+            | b"ini"
+            | b"cfg"
+            | b"conf"
+            | b"html"
+            | b"htm"
+            | b"css"
+            | b"rs"
+            | b"py"
+            | b"js"
+            | b"ts"
+            | b"go"
+            | b"c"
+            | b"h"
+            | b"cpp"
+            | b"hpp"
+            | b"java"
+            | b"rb"
+            | b"sh"
+            | b"sql"
+    )
 }
 
 /// A `dav-server` filesystem backed by the SQLite metadata store and the
@@ -61,12 +193,14 @@ impl DavFs {
         std::fs::create_dir_all(&data_dir)?;
         let blobs = BlobStore::open(data_dir.join("blobs"))?;
         let meta = MetaStore::open(data_dir.join("metadata.sqlite"))?;
+        let index = SearchIndex::open(data_dir.join("index"))?;
         let tmp_dir = data_dir.join("tmp");
         std::fs::create_dir_all(&tmp_dir)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 meta,
                 blobs,
+                index,
                 chunker: ChunkerConfig::default(),
                 tmp_dir,
             }),
@@ -198,7 +332,67 @@ impl DavFs {
         let version = self.inner.meta.version_by_number(node.id, number)?;
         let manifest = self.inner.meta.load_version_manifest(version.id)?;
         self.inner.meta.set_file_content(node.id, &manifest)?;
+        // Reverting changes the current content, so re-tokenize it.
+        self.inner.reindex(node.id);
         Ok(())
+    }
+
+    /// Full-text search over indexed file content, returning up to `limit` hits.
+    ///
+    /// Results are scoped to the collection at `scope` (its subtree); pass the
+    /// root (`/`) to search everything. Each hit's stable node id is resolved to
+    /// its *current* path, so moved/renamed files show their up-to-date location
+    /// and a hit whose file was since deleted is silently dropped (the index is
+    /// lazily reconciled). Ordered by descending relevance.
+    ///
+    /// For a non-root scope, up to [`MAX_SEARCH_FETCH`] candidates are fetched
+    /// from the index before filtering, so an in-scope match ranked below the
+    /// global top-`limit` isn't lost to the cut; a match ranked beyond that pool
+    /// can still be missed (acceptable at personal scale).
+    pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        scope: &DavPath,
+    ) -> Result<Vec<SearchResult>, VfsError> {
+        let scope_node = self.inner.meta.lookup_path(&segments(scope))?;
+        // Resolve the scope to a path prefix once (root → None → matches all).
+        let scope_prefix = if scope_node.id == ROOT_ID {
+            None
+        } else {
+            self.inner.meta.path_of(scope_node.id)?
+        };
+        // When scoped, over-fetch so filtering doesn't starve on the global cut.
+        let fetch = if scope_prefix.is_some() {
+            MAX_SEARCH_FETCH
+        } else {
+            limit
+        };
+        let hits = self.inner.index.search(query, fetch)?;
+        let mut results = Vec::with_capacity(hits.len().min(limit));
+        for hit in hits {
+            if results.len() >= limit {
+                break;
+            }
+            // Resolve the stable id to its *current* path; a since-deleted node
+            // resolves to `None` and is dropped (lazy index reconciliation).
+            let Some(path) = self.inner.meta.path_of(hit.node_id as i64)? else {
+                continue;
+            };
+            // Scope filter by path prefix — resolving first (above) means a stale
+            // hit can't abort the whole search, and one walk serves both purposes.
+            if let Some(prefix) = &scope_prefix
+                && !is_within(&path, prefix)
+            {
+                continue;
+            }
+            results.push(SearchResult {
+                path: String::from_utf8_lossy(&path).into_owned(),
+                snippet: hit.snippet,
+                score: hit.score,
+            });
+        }
+        Ok(results)
     }
 
     /// Delete a specific (non-current) historical version of the file at `path`.
@@ -241,6 +435,18 @@ pub struct VersionInfo {
     pub created: SystemTime,
     /// Whether this is the file's current content.
     pub is_current: bool,
+}
+
+/// One full-text search hit, as surfaced by [`DavFs::search`].
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    /// Absolute virtual path of the matching file (e.g. `/docs/a.md`).
+    pub path: String,
+    /// A highlighted excerpt (matched terms in `<b>…</b>`, HTML-escaped), if one
+    /// could be generated.
+    pub snippet: Option<String>,
+    /// Relevance score (higher is more relevant).
+    pub score: f32,
 }
 
 impl DavFileSystem for DavFs {
@@ -395,6 +601,13 @@ impl DavFileSystem for DavFs {
         async move {
             let node = self.resolve(path)?;
             self.inner.meta.remove_file(node.id).map_err(meta_to_fs)?;
+            // Drop the file's search-index document (blocking commit off-thread).
+            // Only a text-named file could have one, so a binary delete skips the
+            // index entirely (no needless commit) — mirrors `try_reindex`.
+            if is_indexable_name(&node.name) {
+                let inner = self.inner.clone();
+                let _ = tokio::task::spawn_blocking(move || inner.deindex(node.id)).await;
+            }
             Ok(())
         }
         .boxed()
@@ -439,10 +652,18 @@ impl DavFileSystem for DavFs {
                 if existing.is_dir {
                     return Err(FsError::Exists);
                 }
+                // Overwriting a file deletes the destination node, so drop its
+                // search-index document too — otherwise it orphans a doc that a
+                // later rowid reuse could resurface as a phantom hit.
+                let clobbered = is_indexable_name(&existing.name).then_some(existing.id);
                 self.inner
                     .meta
                     .remove_file(existing.id)
                     .map_err(meta_to_fs)?;
+                if let Some(id) = clobbered {
+                    let inner = self.inner.clone();
+                    let _ = tokio::task::spawn_blocking(move || inner.deindex(id)).await;
+                }
             }
             self.inner
                 .meta
@@ -534,6 +755,10 @@ impl DavFileSystem for DavFs {
                         .meta
                         .set_file_content(dst_id, &manifest)
                         .map_err(meta_to_fs)?;
+                    // The destination gained content; index it (reads blobs, so
+                    // run the blocking reindex off the async worker).
+                    let inner = self.inner.clone();
+                    let _ = tokio::task::spawn_blocking(move || inner.reindex(dst_id)).await;
                 }
             }
             Ok(())
@@ -613,6 +838,8 @@ pub enum VfsError {
     Io(std::io::Error),
     /// Metadata-store error.
     Meta(MetaError),
+    /// Search-index error (opening, updating, or querying the reverse index).
+    Index(index::IndexError),
     /// A historical version was too large to reconstruct in memory (its size in
     /// bytes); see [`DavFs::read_version`] and [`MAX_IN_MEMORY_VERSION`].
     TooLarge(u64),
@@ -623,6 +850,7 @@ impl std::fmt::Display for VfsError {
         match self {
             Self::Io(e) => write!(f, "i/o error: {e}"),
             Self::Meta(e) => write!(f, "metadata error: {e}"),
+            Self::Index(e) => write!(f, "search index error: {e}"),
             Self::TooLarge(n) => write!(f, "version too large to serve in memory: {n} bytes"),
         }
     }
@@ -638,6 +866,12 @@ impl VfsError {
     pub fn is_too_large(&self) -> bool {
         matches!(self, VfsError::TooLarge(_))
     }
+
+    /// Whether this error is a malformed user search query (so the router can
+    /// return 400 rather than 500).
+    pub fn is_bad_query(&self) -> bool {
+        matches!(self, VfsError::Index(index::IndexError::BadQuery(_)))
+    }
 }
 
 impl std::error::Error for VfsError {}
@@ -651,6 +885,12 @@ impl From<std::io::Error> for VfsError {
 impl From<MetaError> for VfsError {
     fn from(e: MetaError) -> Self {
         VfsError::Meta(e)
+    }
+}
+
+impl From<index::IndexError> for VfsError {
+    fn from(e: index::IndexError) -> Self {
+        VfsError::Index(e)
     }
 }
 
@@ -1045,5 +1285,160 @@ mod tests {
         assert!(fs.prune_version(&dp("/f"), 99).unwrap_err().is_not_found());
         // Current content is intact.
         assert_eq!(read_file(&fs, "/f").await, b"v3");
+    }
+
+    #[tokio::test]
+    async fn search_finds_written_text_content() {
+        let (_dir, fs) = temp_fs();
+        write_file(
+            &fs,
+            "/notes.md",
+            b"# Project chishiki\nA versioned webdav server.",
+        )
+        .await;
+        write_file(&fs, "/other.md", b"unrelated grocery list").await;
+        // Binary media is not indexed even with matching words in the name.
+        write_file(&fs, "/chishiki.png", b"chishiki server webdav bytes").await;
+
+        let hits = fs.search("webdav", 10, &dp("/")).unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, vec!["/notes.md"]);
+
+        // Conjunction semantics: all terms must match.
+        assert!(fs.search("grocery list", 10, &dp("/")).unwrap().len() == 1);
+        assert!(
+            fs.search("grocery webdav", 10, &dp("/"))
+                .unwrap()
+                .is_empty()
+        );
+
+        // A hit carries a highlighted snippet.
+        assert!(
+            hits[0]
+                .snippet
+                .as_deref()
+                .unwrap()
+                .contains("<b>webdav</b>")
+        );
+    }
+
+    #[tokio::test]
+    async fn search_reflects_edits_moves_and_deletes() {
+        let (_dir, fs) = temp_fs();
+        fs.create_dir(&dp("/docs")).await.unwrap();
+        write_file(&fs, "/docs/a.md", b"the aardvark forages at dawn").await;
+
+        // Found at its original path.
+        assert_eq!(
+            fs.search("aardvark", 10, &dp("/")).unwrap()[0].path,
+            "/docs/a.md"
+        );
+
+        // Move it: the stable node id means no reindex, and the hit shows the new path.
+        fs.rename(&dp("/docs/a.md"), &dp("/moved.md"))
+            .await
+            .unwrap();
+        assert_eq!(
+            fs.search("aardvark", 10, &dp("/")).unwrap()[0].path,
+            "/moved.md"
+        );
+
+        // Overwrite the content: the old term is gone, the new one is found.
+        write_file(&fs, "/moved.md", b"now about badgers only").await;
+        assert!(fs.search("aardvark", 10, &dp("/")).unwrap().is_empty());
+        assert_eq!(fs.search("badgers", 10, &dp("/")).unwrap().len(), 1);
+
+        // Delete it: dropped from results.
+        fs.remove_file(&dp("/moved.md")).await.unwrap();
+        assert!(fs.search("badgers", 10, &dp("/")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn is_indexable_name_excludes_dotfiles_and_binaries() {
+        assert!(is_indexable_name(b"notes.md"));
+        assert!(is_indexable_name(b"Config.TOML")); // case-insensitive
+        // Dot-prefixed names (incl. macOS AppleDouble) are never indexed.
+        assert!(!is_indexable_name(b".md"));
+        assert!(!is_indexable_name(b".DS_Store"));
+        assert!(!is_indexable_name(b"._notes.md"));
+        // No extension / binary media.
+        assert!(!is_indexable_name(b"README"));
+        assert!(!is_indexable_name(b"photo.png"));
+        assert!(!is_indexable_name(b"clip.mp4"));
+    }
+
+    #[test]
+    fn is_within_respects_path_boundaries() {
+        assert!(is_within(b"/docs/a.md", b"/docs"));
+        assert!(is_within(b"/docs/sub/a.md", b"/docs"));
+        // A sibling that merely shares a prefix is not inside.
+        assert!(!is_within(b"/docsX/a.md", b"/docs"));
+        // The scope directory itself is not a file within itself.
+        assert!(!is_within(b"/docs", b"/docs"));
+    }
+
+    #[tokio::test]
+    async fn dotfiles_are_not_searchable() {
+        let (_dir, fs) = temp_fs();
+        write_file(&fs, "/._notes.md", b"applesauce hidden appledouble junk").await;
+        write_file(&fs, "/visible.md", b"applesauce visible content").await;
+        // Only the non-dot file is indexed.
+        let hits = fs.search("applesauce", 10, &dp("/")).unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, vec!["/visible.md"]);
+    }
+
+    #[tokio::test]
+    async fn rename_over_existing_file_deindexes_the_clobbered_doc() {
+        let (_dir, fs) = temp_fs();
+        write_file(&fs, "/keep.md", b"the wombat content").await;
+        write_file(&fs, "/victim.md", b"the platypus content").await;
+        assert_eq!(fs.search("platypus", 10, &dp("/")).unwrap().len(), 1);
+
+        // Move keep.md onto victim.md: victim's node is deleted, so its index
+        // document must go too (not linger to resurface via rowid reuse).
+        fs.rename(&dp("/keep.md"), &dp("/victim.md")).await.unwrap();
+        assert!(fs.search("platypus", 10, &dp("/")).unwrap().is_empty());
+        // The moved content is still findable at its new path.
+        assert_eq!(
+            fs.search("wombat", 10, &dp("/")).unwrap()[0].path,
+            "/victim.md"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_search_survives_a_stale_index_hit() {
+        // A directly-inserted index document for a node id that never existed
+        // simulates a stale/orphaned hit. A scoped search must drop it, not abort.
+        let (_dir, fs) = temp_fs();
+        fs.create_dir(&dp("/scope")).await.unwrap();
+        write_file(&fs, "/scope/real.md", b"zebra in scope").await;
+        // Orphan doc: node id 999_999 has no row in `nodes`.
+        fs.inner
+            .index
+            .index_document(999_999, "zebra orphaned ghost")
+            .unwrap();
+        fs.inner.index.commit().unwrap();
+
+        // Scoped search still returns the real hit and silently drops the orphan.
+        let hits = fs.search("zebra", 10, &dp("/scope")).unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, vec!["/scope/real.md"]);
+    }
+
+    #[tokio::test]
+    async fn search_is_scoped_to_a_collection_subtree() {
+        let (_dir, fs) = temp_fs();
+        fs.create_dir(&dp("/a")).await.unwrap();
+        fs.create_dir(&dp("/b")).await.unwrap();
+        write_file(&fs, "/a/one.md", b"shared keyword apple").await;
+        write_file(&fs, "/b/two.md", b"shared keyword banana").await;
+
+        // Root scope sees both.
+        assert_eq!(fs.search("shared", 10, &dp("/")).unwrap().len(), 2);
+        // A subtree scope sees only its own.
+        let in_a = fs.search("shared", 10, &dp("/a")).unwrap();
+        assert_eq!(in_a.len(), 1);
+        assert_eq!(in_a[0].path, "/a/one.md");
     }
 }

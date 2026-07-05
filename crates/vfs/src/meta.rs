@@ -441,6 +441,45 @@ impl MetaStore {
         Ok(())
     }
 
+    /// Reconstruct the absolute virtual path of a node by walking to the root.
+    ///
+    /// Returns e.g. `/docs/a.md`; the root itself is `/`. `Ok(None)` if the node
+    /// no longer exists (e.g. a stale search hit whose file was deleted). Used to
+    /// resolve a search hit's (stable) node id back to its current path, so a
+    /// move/rename needs no reindex.
+    pub fn path_of(&self, id: i64) -> Result<Option<Vec<u8>>> {
+        let mut names: Vec<Vec<u8>> = Vec::new();
+        let mut current = id;
+        // Bounded to guard against a pre-existing cycle in the data.
+        for _ in 0..10_000 {
+            let node = match self.get_node(current) {
+                Ok(n) => n,
+                Err(MetaError::NotFound) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            match node.parent_id {
+                // The root has an empty name and is represented by the leading `/`.
+                Some(parent) => {
+                    names.push(node.name);
+                    current = parent;
+                }
+                None => {
+                    names.reverse();
+                    let mut path = Vec::new();
+                    for name in &names {
+                        path.push(b'/');
+                        path.extend_from_slice(name);
+                    }
+                    if path.is_empty() {
+                        path.push(b'/');
+                    }
+                    return Ok(Some(path));
+                }
+            }
+        }
+        Err(MetaError::Corrupt)
+    }
+
     /// Whether `ancestor` is `node` itself or one of its ancestors.
     ///
     /// Used to reject moving/copying a collection into its own subtree, which

@@ -9,7 +9,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
-use vfs::{DirEntryInfo, VersionInfo};
+use vfs::{DirEntryInfo, SearchResult, VersionInfo};
 
 /// Vendored Bulma, embedded so the server is self-contained (served at
 /// `/_assets/bulma.css`).
@@ -123,7 +123,8 @@ pub(crate) fn sidebar(
         }
     }
 
-    let mut menu = breadcrumb(dir_segments);
+    let mut menu = search_box();
+    menu.push_str(&breadcrumb(dir_segments));
     menu.push_str("<div class=\"menu\">");
     if !folders.is_empty() {
         menu.push_str(&format!(
@@ -140,6 +141,48 @@ pub(crate) fn sidebar(
     }
     menu.push_str("</div>");
     menu
+}
+
+/// The sidebar's global search box (a `GET /?q=…` form). Present on every page so
+/// search is always reachable; searching from the root scopes to the whole store.
+fn search_box() -> String {
+    "<form class=\"field mb-4\" action=\"/\" method=\"get\" role=\"search\">\
+     <div class=\"control\">\
+     <input class=\"input is-small\" type=\"search\" name=\"q\" \
+     placeholder=\"Search\u{2026}\" aria-label=\"Search\">\
+     </div></form>"
+        .to_string()
+}
+
+/// Search-results main pane: each hit links to its file, with a highlighted
+/// snippet beneath. `query` is the raw user query (escaped here for display).
+pub(crate) fn search_main(query: &str, results: &[SearchResult]) -> String {
+    let q = escape_html(query);
+    let count = results.len();
+    let mut body = String::new();
+    if results.is_empty() {
+        body.push_str("<p class=\"notification\">No matches.</p>");
+    } else {
+        body.push_str("<ul class=\"search-results\">");
+        for r in results {
+            let href = path_href(&r.path);
+            let path = escape_html(&r.path);
+            // The snippet is already HTML (tantivy escapes the text and wraps
+            // matched terms in <b>…</b>), so it is inlined without re-escaping.
+            let snippet = r.snippet.as_deref().unwrap_or("");
+            body.push_str(&format!(
+                "<li><a href=\"{href}\">{path}</a>\
+                 <p class=\"snippet is-size-7 has-text-grey\">{snippet}</p></li>"
+            ));
+        }
+        body.push_str("</ul>");
+    }
+    format!(
+        "<h1 class=\"title is-5\">Search results for \u{201c}{q}\u{201d}</h1>\
+         <p class=\"subtitle is-6\">{count} match{es}</p>\
+         <div class=\"content\">{body}</div>",
+        es = if count == 1 { "" } else { "es" }
+    )
 }
 
 /// Directory main pane: a rendered `README` if present, else an index table.
@@ -313,6 +356,18 @@ fn file_href(dir_segments: &[String], name: &str) -> String {
     }
 }
 
+/// Absolute, percent-encoded href for a full slash-separated virtual path
+/// (e.g. `/docs/a b.md` → `/docs/a%20b.md`), for search-result links and the
+/// SEARCH-method multistatus response.
+pub(crate) fn path_href(path: &str) -> String {
+    let segments: Vec<String> = path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    dir_href(&segments)
+}
+
 pub(crate) fn encode_segment(name: &str) -> String {
     utf8_percent_encode(name, SEGMENT).to_string()
 }
@@ -390,6 +445,8 @@ background:var(--bulma-scheme-main-bis)}\
 .app-sidebar .breadcrumb{margin-bottom:1rem}\
 .app-sidebar .menu-label{margin-top:1rem}\
 .app-main .actions form{display:inline;margin-left:.35rem}\
+.app-main .search-results li{margin-bottom:.9rem}\
+.app-main .search-results .snippet{margin-top:.15rem}\
 .app-main figure.image img{max-width:100%;height:auto}\
 @media(max-width:768px){.app{flex-direction:column;height:auto}\
 .app-sidebar{width:auto;max-width:none;border-right:none;\

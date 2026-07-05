@@ -55,6 +55,10 @@ bytes = "1"
 futures-util = "0.3"
 pulldown-cmark = "0.13"
 percent-encoding = "2"
+# Full-text search engine backing the reverse index (Phase 5).
+tantivy = "0.26"
+# XML reader for parsing RFC 5323 SEARCH request bodies in the router.
+quick-xml = "0.41"
 
 [profile.release]
 lto = "thin"

@@ -308,10 +308,14 @@ impl DavFile for FileHandle {
                             .blobs
                             .store_file(&file, inner.chunker)
                             .map_err(io_to_fs)?;
-                        inner
+                        let modified = inner
                             .meta
                             .set_file_content(node_id, &manifest)
-                            .map_err(meta_to_fs)
+                            .map_err(meta_to_fs)?;
+                        // Update the reverse index with the new content (still on
+                        // this blocking thread). Best-effort; logged on failure.
+                        inner.reindex(node_id);
+                        Ok(modified)
                     })
                     .await
                     .map_err(|_| FsError::GeneralFailure)??;

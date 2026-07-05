@@ -6,18 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Rust** project, built as a **Cargo workspace**. Phases 0 (workspace &
 toolchain), 1 (content-addressable blob store + FastCDC chunker), 2 (virtualized
-filesystem + working WebDAV server), and 3 (auto-versioning) are complete, and
-Phase 4 (browser web interface, incl. a two-pane Bulma UI) has landed. See
-`docs/specs/0001-initial-build-plan.md` for the phased plan, and
+filesystem + working WebDAV server), 3 (auto-versioning), 4 (browser web
+interface, incl. a two-pane Bulma UI), and 5 (full-text search) are complete. See
+`docs/specs/0001-initial-build-plan.md` for the phased plan,
 `docs/specs/0002-web-interface.md` + `docs/specs/0003-web-ui.md` for the
-web-interface design.
+web-interface design, and `docs/specs/0004-search.md` for the search design.
 
 Layout:
 
 - `crates/blobstore` — content-addressable blob store; blake3-keyed blobs + FastCDC file manifests (Phase 1 ✓)
 - `crates/chunker` — FastCDC content-defined chunking (Phase 1 ✓)
 - `crates/vfs` — virtualized filesystem: SQLite (`rusqlite`) metadata store with immutable per-file version history, + the `dav-server` `DavFileSystem`/`DavFile`/`DavMetaData` traits over the blob store (Phases 2–3 ✓)
-- `crates/index` — reverse index for search, `tantivy` (Phase 5)
+- `crates/index` — reverse (inverted) full-text index, `tantivy`; keyed by node id + tokenized body (Phase 5 ✓)
 - `crates/webdav-server` — the WebDAV/HTTP binary; axum router in front of `dav-server`'s `DavHandler` + `MemLs`, backed by `vfs::DavFs`; version-history endpoints and the browser layer (own directory index, per-file version pages with revert/prune, Markdown rendering) in the `web` module (Phases 2–4 ✓)
 
 The library crates are WebDAV-agnostic so the storage engine ships without
@@ -98,6 +98,34 @@ writes are unauthenticated (trusted-network assumption).
 
 `read_current`/`read_version` reconstruct into memory (capped); the streaming
 owned-reader is the deferred TODO.
+
+**Full-text search (Phase 5).** A **tantivy** reverse index (`crates/index`) over
+text content, kept in sync from the `vfs` write path; the router exposes it. See
+`docs/specs/0004-search.md`.
+- **`index` crate** is storage-agnostic: documents are keyed by the **stable node
+  id** and carry a tokenized `body`. `index_document`/`remove_document`/`commit`/
+  `search` — a hit is `{node_id, score, snippet}`. Keying on the node id (not the
+  path) means a **move/rename needs no reindex**; only a content change
+  re-tokenizes, a delete removes by id. tantivy has one writer (behind a mutex);
+  a `commit` (which reloads the reader) makes writes searchable.
+- **`vfs` owns policy.** `Inner::reindex(node_id)` reads the node's current
+  content and indexes it *iff* the name looks like text (`is_indexable_name`) and
+  it's within `MAX_INDEX_BYTES` (4 MiB), else removes any stale doc. Hooked into
+  every content write: `FileHandle::flush` (on the chunking blocking thread),
+  `DavFs::copy`, `DavFs::revert_to_version`; `DavFs::remove_file` deindexes.
+  **Index updates are best-effort — logged, never propagated**, since the
+  metadata/blob store is the source of truth and a derived-index failure must not
+  fail an already-durable write. `DavFs::search` runs the query, resolves each
+  hit's node id to its **current** path (`MetaStore::path_of`, lazily dropping a
+  since-deleted node), and filters to the scope subtree.
+- **Two surfaces in the router.** (1) Browser `GET …?q=…` (scoped to the path's
+  subtree; root = global) → a results page in the shell for browsers, JSON
+  otherwise; a sidebar search box is on every page. (2) The RFC 5323 **`SEARCH`**
+  method → the free-text subset of `DAV:basicsearch` (`DAV:contains` / `DAV:like`
+  literal), answered as a `207 Multi-Status`; `OPTIONS` advertises
+  `DASL: <DAV:basicsearch>`. AND-by-default grammar; a malformed query is a 400.
+- Deferred (Phase 6): startup reindex of pre-existing content, batched commits,
+  ranking/analyzer tuning, the full DASL predicate grammar, auth on search.
 
 Toolchain is pinned by `rust-toolchain.toml` (Rust **1.96.0**, edition **2024**,
 with `rustfmt` + `clippy`).

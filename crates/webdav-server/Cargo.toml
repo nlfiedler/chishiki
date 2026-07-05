@@ -15,6 +15,8 @@ axum.workspace = true
 tokio.workspace = true
 pulldown-cmark.workspace = true
 percent-encoding.workspace = true
+# Parses RFC 5323 SEARCH request bodies (DAV:basicsearch) in the router.
+quick-xml.workspace = true
 
 [lints]
 workspace = true
