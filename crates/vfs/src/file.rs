@@ -303,17 +303,24 @@ impl DavFile for FileHandle {
                 // file size; run it off the async worker.
                 let modified =
                     tokio::task::spawn_blocking(move || -> Result<SystemTime, FsError> {
-                        let file = std::fs::File::open(&path).map_err(io_to_fs)?;
-                        let manifest = inner
-                            .blobs
-                            .store_file(&file, inner.chunker)
-                            .map_err(io_to_fs)?;
-                        let modified = inner
-                            .meta
-                            .set_file_content(node_id, &manifest)
-                            .map_err(meta_to_fs)?;
+                        // Store the new blobs and record them under a shared GC
+                        // guard, so garbage collection can't delete a freshly
+                        // written blob in the window before it's referenced.
+                        let modified = {
+                            let _gc = inner.gc_lock.read().unwrap_or_else(|e| e.into_inner());
+                            let file = std::fs::File::open(&path).map_err(io_to_fs)?;
+                            let manifest = inner
+                                .blobs
+                                .store_file(&file, inner.chunker)
+                                .map_err(io_to_fs)?;
+                            inner
+                                .meta
+                                .set_file_content(node_id, &manifest)
+                                .map_err(meta_to_fs)?
+                        };
                         // Update the reverse index with the new content (still on
                         // this blocking thread). Best-effort; logged on failure.
+                        // The content is now referenced, so no GC guard is needed.
                         inner.reindex(node_id);
                         Ok(modified)
                     })

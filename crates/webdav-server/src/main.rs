@@ -28,7 +28,7 @@ use axum::{Extension, Router};
 use dav_server::DavHandler;
 use dav_server::davpath::DavPath;
 use dav_server::memls::MemLs;
-use vfs::{DavFs, SearchResult, VersionInfo};
+use vfs::{DavFs, GcStats, SearchResult, VersionInfo};
 
 /// Directory that holds the blob store, metadata database, and upload staging.
 const DEFAULT_DATA_DIR: &str = "./data";
@@ -241,8 +241,9 @@ async fn file_page(fs: &DavFs, path: &DavPath, path_str: &str) -> Response {
     html_response(web::page(&name, &sidebar, &main))
 }
 
-/// Handle a version-mutating `POST` (`?revert=N` / `?prune=N`). Returns `None` for
-/// a `POST` without a recognized action (falls through — `DavHandler` will 405).
+/// Handle a state-changing `POST`: `?revert=N` / `?prune=N` (per-file) or `?gc`
+/// (store-wide). Returns `None` for a `POST` without a recognized action (falls
+/// through — `DavHandler` will 405).
 ///
 /// The request pieces are passed by value (`query`, `path_str`, `cross_origin`)
 /// rather than as `&Request`, so nothing un-`Sync` is held across the `.await`.
@@ -259,37 +260,46 @@ async fn handle_post_action(
     if cross_origin {
         return Some((StatusCode::FORBIDDEN, "cross-origin request refused").into_response());
     }
-    let Ok(path) = DavPath::new(path_str) else {
-        return Some(bad_request("bad path"));
-    };
-    let number = match action {
-        Action::Revert(n) | Action::Prune(n) => n,
-        Action::Bad => return Some(bad_request("invalid action")),
-    };
-    let revert = matches!(action, Action::Revert(_));
-    // revert reconstructs content and commits the search index (fsync), and both
-    // touch SQLite; run the mutation off the async worker.
-    let fs_owned = fs.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        if revert {
-            fs_owned.revert_to_version(&path, number)
-        } else {
-            fs_owned.prune_version(&path, number)
+    Some(match action {
+        Action::Bad => bad_request("invalid action"),
+        Action::Gc => {
+            // Store-wide, path-independent: only honor it at the root so a
+            // scoped-looking `POST /file?gc` can't trigger a global sweep.
+            if path_str != "/" {
+                return Some(bad_request("gc is only available at POST /?gc"));
+            }
+            let fs_owned = fs.clone();
+            // GC scans/deletes blobs (disk I/O under an exclusive lock); off-thread.
+            match tokio::task::spawn_blocking(move || fs_owned.gc()).await {
+                Ok(Ok(stats)) => json_response(gc_stats_json(&stats)),
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, "gc failed").into_response(),
+            }
         }
-    })
-    .await;
-    let result = match result {
-        Ok(r) => r,
-        Err(_) => {
-            return Some((StatusCode::INTERNAL_SERVER_ERROR, "action failed").into_response());
+        Action::Revert(number) | Action::Prune(number) => {
+            let Ok(path) = DavPath::new(path_str) else {
+                return Some(bad_request("bad path"));
+            };
+            let revert = matches!(action, Action::Revert(_));
+            // revert reconstructs content and commits the search index (fsync),
+            // and both touch SQLite; run the mutation off the async worker.
+            let fs_owned = fs.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                if revert {
+                    fs_owned.revert_to_version(&path, number)
+                } else {
+                    fs_owned.prune_version(&path, number)
+                }
+            })
+            .await;
+            match result {
+                // POST-redirect-GET back to the (now-updated) version page.
+                Ok(Ok(())) => redirect(StatusCode::SEE_OTHER, &format!("{path_str}?versions")),
+                Ok(Err(e)) if e.is_not_found() => not_found(),
+                // e.g. "cannot delete the current version".
+                Ok(Err(e)) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+                Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "action failed").into_response(),
+            }
         }
-    };
-    Some(match result {
-        // POST-redirect-GET back to the (now-updated) version page.
-        Ok(()) => redirect(StatusCode::SEE_OTHER, &format!("{path_str}?versions")),
-        Err(e) if e.is_not_found() => not_found(),
-        // e.g. "cannot delete the current version".
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     })
 }
 
@@ -405,6 +415,14 @@ fn search_to_json(hits: &[SearchResult]) -> String {
         })
         .collect();
     format!("[{}]", items.join(","))
+}
+
+/// Render a garbage-collection summary as JSON (all fields numeric).
+fn gc_stats_json(stats: &GcStats) -> String {
+    format!(
+        r#"{{"scanned":{},"removed":{},"reclaimed":{},"failed":{}}}"#,
+        stats.blobs_scanned, stats.blobs_removed, stats.bytes_reclaimed, stats.blobs_failed
+    )
 }
 
 /// Encode a string as a JSON string literal (with surrounding quotes).
@@ -680,21 +698,24 @@ fn parse_version_query(query: &str) -> VersionRequest {
     }
 }
 
-/// A version-mutating action from a `POST` query string.
+/// A state-changing action from a `POST` query string.
 enum Action {
     Revert(u64),
     Prune(u64),
+    /// Store-wide chunk garbage collection (`?gc`, no value).
+    Gc,
     /// An action key was present but its value didn't parse.
     Bad,
 }
 
-/// Parse a `POST` query for `revert=N` / `prune=N`. `None` if neither is present.
+/// Parse a `POST` query for `revert=N` / `prune=N` / `gc`. `None` if none present.
 fn parse_action_query(query: &str) -> Option<Action> {
     for pair in query.split('&').filter(|s| !s.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         match key {
             "revert" => return Some(value.parse().map(Action::Revert).unwrap_or(Action::Bad)),
             "prune" => return Some(value.parse().map(Action::Prune).unwrap_or(Action::Bad)),
+            "gc" => return Some(Action::Gc),
             _ => {}
         }
     }
@@ -948,8 +969,25 @@ mod tests {
             Some(Action::Prune(5))
         ));
         assert!(matches!(parse_action_query("revert=x"), Some(Action::Bad)));
+        // `gc` is a valueless action.
+        assert!(matches!(parse_action_query("gc"), Some(Action::Gc)));
+        assert!(matches!(parse_action_query("gc=1"), Some(Action::Gc)));
         assert!(parse_action_query("").is_none());
         assert!(parse_action_query("other=1").is_none());
+    }
+
+    #[test]
+    fn gc_stats_json_shape() {
+        let stats = GcStats {
+            blobs_scanned: 12,
+            blobs_removed: 3,
+            bytes_reclaimed: 4096,
+            blobs_failed: 1,
+        };
+        assert_eq!(
+            gc_stats_json(&stats),
+            r#"{"scanned":12,"removed":3,"reclaimed":4096,"failed":1}"#
+        );
     }
 
     #[test]

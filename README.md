@@ -97,6 +97,8 @@ curl http://127.0.0.1:4918/notes.md                      # download raw
 curl -X MKCOL http://127.0.0.1:4918/docs                 # make a collection
 curl http://127.0.0.1:4918/notes.md?versions             # version history (JSON)
 curl http://127.0.0.1:4918/notes.md?version=1            # fetch a specific version
+curl 'http://127.0.0.1:4918/?q=search+terms'             # full-text search (JSON)
+curl -X POST http://127.0.0.1:4918/?gc                   # reclaim unreferenced chunks
 ```
 
 ### Development

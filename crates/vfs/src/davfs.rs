@@ -32,6 +32,20 @@ pub(crate) struct Inner {
     pub(crate) chunker: ChunkerConfig,
     /// Full-text reverse index over indexable file content (Phase 5).
     pub(crate) index: SearchIndex,
+    /// Coordinates blob garbage collection with content writes (Phase 6).
+    ///
+    /// GC deletes a blob only if the live set (a snapshot of `version_chunks`)
+    /// doesn't reference it. The hazard is a write that adds a *new* reference to
+    /// a hash that was unreferenced at snapshot time; if GC then deletes that
+    /// blob, the write dangles. So **every path that adds a chunk reference holds
+    /// a shared (read) guard** across confirming the chunk is present/referenced
+    /// and recording the new reference, and **GC holds the exclusive (write)
+    /// guard** across mark + sweep. The reference-adding paths are:
+    /// `FileHandle::flush` (stores brand-new blobs) and the reference-only writes
+    /// `DavFs::copy` / `DavFs::revert_to_version` (via [`Inner::reference_under_guard`],
+    /// which reuse chunks that a concurrent delete/prune could otherwise strand).
+    /// Reads add no references and need no guard.
+    pub(crate) gc_lock: std::sync::RwLock<()>,
     /// Directory for in-progress upload temp files.
     pub(crate) tmp_dir: PathBuf,
 }
@@ -95,6 +109,25 @@ impl Inner {
         let text = String::from_utf8_lossy(&buf);
         self.index.index_document(node_id as u64, &text)?;
         self.index.commit()?;
+        Ok(())
+    }
+
+    /// Reference an already-stored manifest as `node_id`'s new content, holding
+    /// the shared GC guard across loading the manifest and recording the reference.
+    ///
+    /// For reference-only writes (copy, revert) that reuse chunks already in the
+    /// blob store: the guard stops GC from sweeping a chunk in the window between
+    /// confirming it's referenced (loading the source/version manifest) and
+    /// re-referencing it — a concurrent delete/prune of the source could
+    /// otherwise drop its last reference and make it collectible. See
+    /// [`Inner::gc_lock`]; `flush` holds the same guard around storing *new* blobs.
+    fn reference_under_guard<F>(&self, node_id: i64, load: F) -> Result<(), MetaError>
+    where
+        F: FnOnce(&MetaStore) -> Result<Manifest, MetaError>,
+    {
+        let _gc = self.gc_lock.read().unwrap_or_else(|e| e.into_inner());
+        let manifest = load(&self.meta)?;
+        self.meta.set_file_content(node_id, &manifest)?;
         Ok(())
     }
 
@@ -202,6 +235,7 @@ impl DavFs {
                 blobs,
                 index,
                 chunker: ChunkerConfig::default(),
+                gc_lock: std::sync::RwLock::new(()),
                 tmp_dir,
             }),
         })
@@ -329,9 +363,11 @@ impl DavFs {
     /// since [`MetaStore::set_file_content`] deduplicates.)
     pub fn revert_to_version(&self, path: &DavPath, number: u64) -> Result<(), VfsError> {
         let node = self.resolve_file(path)?;
-        let version = self.inner.meta.version_by_number(node.id, number)?;
-        let manifest = self.inner.meta.load_version_manifest(version.id)?;
-        self.inner.meta.set_file_content(node.id, &manifest)?;
+        let version_id = self.inner.meta.version_by_number(node.id, number)?.id;
+        // Re-reference the old version's chunks under the GC guard (they could be
+        // unique to that version, which a concurrent prune could strand).
+        self.inner
+            .reference_under_guard(node.id, |meta| meta.load_version_manifest(version_id))?;
         // Reverting changes the current content, so re-tokenize it.
         self.inner.reindex(node.id);
         Ok(())
@@ -395,10 +431,61 @@ impl DavFs {
         Ok(results)
     }
 
+    /// Reclaim unreferenced chunk blobs (mark-and-sweep garbage collection).
+    ///
+    /// Deletes every blob whose hash is referenced by no version of any file —
+    /// the storage that pruning a version or deleting a file leaves behind, plus
+    /// any blob orphaned by a write that failed after storing chunks but before
+    /// recording them. Returns a summary of what was scanned and freed.
+    ///
+    /// Concurrency-safe against writes: an exclusive [`Inner::gc_lock`] guard is
+    /// held across collecting the live set and sweeping, so a blob can't be
+    /// deleted in the window after a concurrent write stores or references it.
+    /// This is an **in-process** guard — GC must run in the server process (e.g.
+    /// via its admin endpoint), not a second process sharing the data directory
+    /// while the server is live.
+    ///
+    /// The exclusive guard is held across the whole O(number of blobs) sweep, so
+    /// content writes are blocked for its duration — acceptable for an
+    /// operator-triggered, infrequent GC at personal scale; incremental GC that
+    /// bounds the write-stall is a deferred refinement.
+    ///
+    /// A blob that can't be deleted (e.g. a transient I/O error) is counted in
+    /// [`GcStats::blobs_failed`] and skipped rather than aborting the run. This is
+    /// O(number of blobs) disk work; callers should run it off the async runtime
+    /// (`spawn_blocking`).
+    pub fn gc(&self) -> Result<GcStats, VfsError> {
+        let _guard = self
+            .inner
+            .gc_lock
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let live = self.inner.meta.referenced_chunk_hashes()?;
+        let mut stats = GcStats::default();
+        for hash in self.inner.blobs.list_hashes()? {
+            stats.blobs_scanned += 1;
+            if live.contains(&hash) {
+                continue;
+            }
+            match self.inner.blobs.remove(&hash) {
+                Ok(bytes) => {
+                    stats.bytes_reclaimed += bytes;
+                    stats.blobs_removed += 1;
+                }
+                // Skip and keep going so one bad blob can't stall reclamation.
+                Err(e) => {
+                    stats.blobs_failed += 1;
+                    eprintln!("chishiki: gc failed to remove blob {}: {e}", hash.to_hex());
+                }
+            }
+        }
+        Ok(stats)
+    }
+
     /// Delete a specific (non-current) historical version of the file at `path`.
     ///
-    /// This frees version metadata only; the referenced chunk blobs remain until
-    /// chunk GC (Phase 6). See [`MetaStore::delete_version`].
+    /// This frees version metadata only; the referenced chunk blobs are reclaimed
+    /// the next time [`gc`](Self::gc) runs. See [`MetaStore::delete_version`].
     pub fn prune_version(&self, path: &DavPath, number: u64) -> Result<(), VfsError> {
         let node = self.resolve_file(path)?;
         self.inner.meta.delete_version(node.id, number)?;
@@ -435,6 +522,19 @@ pub struct VersionInfo {
     pub created: SystemTime,
     /// Whether this is the file's current content.
     pub is_current: bool,
+}
+
+/// Summary of a garbage-collection run, as returned by [`DavFs::gc`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcStats {
+    /// Total blobs examined on disk.
+    pub blobs_scanned: u64,
+    /// Blobs deleted because no version referenced them.
+    pub blobs_removed: u64,
+    /// Bytes freed by the deleted blobs.
+    pub bytes_reclaimed: u64,
+    /// Unreferenced blobs that could not be deleted (skipped; see the log).
+    pub blobs_failed: u64,
 }
 
 /// One full-text search hit, as surfaced by [`DavFs::search`].
@@ -750,10 +850,13 @@ impl DavFileSystem for DavFs {
                 // we avoid creating a spurious empty version. Otherwise mirror the
                 // source's current content (shared chunks make this cheap).
                 if src.current_version_id.is_some() || dst_existed {
-                    let manifest = self.inner.meta.load_manifest(src.id).map_err(meta_to_fs)?;
+                    // Mirror the source's current chunks onto the destination under
+                    // the GC guard (loading the manifest and recording the new
+                    // reference as one guarded step, so a concurrent delete + GC
+                    // can't sweep a chunk between them).
+                    let src_id = src.id;
                     self.inner
-                        .meta
-                        .set_file_content(dst_id, &manifest)
+                        .reference_under_guard(dst_id, |meta| meta.load_manifest(src_id))
                         .map_err(meta_to_fs)?;
                     // The destination gained content; index it (reads blobs, so
                     // run the blocking reindex off the async worker).
@@ -1424,6 +1527,85 @@ mod tests {
         let hits = fs.search("zebra", 10, &dp("/scope")).unwrap();
         let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
         assert_eq!(paths, vec!["/scope/real.md"]);
+    }
+
+    #[tokio::test]
+    async fn gc_reclaims_only_unreferenced_blobs() {
+        let (_dir, fs) = temp_fs();
+        // Two versions with distinct content → distinct chunk blobs, both kept
+        // (history references v1). Use content large enough to guarantee chunks.
+        let v1 = pseudo_random(300_000, 10);
+        let v2 = pseudo_random(300_000, 20);
+        write_file(&fs, "/big.bin", &v1).await;
+        write_file(&fs, "/big.bin", &v2).await;
+
+        // Nothing is unreferenced yet: both versions are live.
+        let before = tokio::task::spawn_blocking({
+            let fs = fs.clone();
+            move || fs.gc().unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(before.blobs_removed, 0);
+        assert!(before.blobs_scanned > 0);
+
+        // Prune v1: its unique chunks become unreferenced.
+        fs.prune_version(&dp("/big.bin"), 1).unwrap();
+        let after = fs.gc().unwrap();
+        assert!(after.blobs_removed > 0);
+        assert!(after.bytes_reclaimed > 0);
+
+        // The current version is intact and fully reconstructable.
+        assert_eq!(read_file(&fs, "/big.bin").await, v2);
+        // A second GC has nothing left to do, and now scans fewer blobs than the
+        // first run did (the pruned version's chunks are gone).
+        let again = fs.gc().unwrap();
+        assert_eq!(again.blobs_removed, 0);
+        assert!(again.blobs_scanned < before.blobs_scanned);
+    }
+
+    #[tokio::test]
+    async fn revert_then_gc_keeps_the_reverted_content() {
+        let (_dir, fs) = temp_fs();
+        let a = pseudo_random(300_000, 30);
+        let b = pseudo_random(300_000, 40);
+        write_file(&fs, "/f.bin", &a).await; // v1
+        write_file(&fs, "/f.bin", &b).await; // v2 (current)
+
+        // Revert to v1 (appends v3 re-referencing v1's chunks under the GC guard),
+        // then prune v2 so its unique chunks become collectible.
+        fs.revert_to_version(&dp("/f.bin"), 1).unwrap();
+        fs.prune_version(&dp("/f.bin"), 2).unwrap();
+
+        let stats = fs.gc().unwrap();
+        assert!(stats.blobs_removed > 0); // v2's now-unreferenced chunks reclaimed
+        assert_eq!(stats.blobs_failed, 0);
+        // The reverted (current) content is intact — its chunks were not swept.
+        assert_eq!(read_file(&fs, "/f.bin").await, a);
+    }
+
+    #[tokio::test]
+    async fn gc_keeps_blobs_shared_by_another_file() {
+        let (_dir, fs) = temp_fs();
+        // Identical content dedups to shared blobs across the two files.
+        write_file(&fs, "/a.txt", b"shared content that both files hold").await;
+        fs.copy(&dp("/a.txt"), &dp("/b.txt")).await.unwrap();
+
+        // Delete one file: its chunks are still referenced by the other, so GC
+        // must not remove them.
+        fs.remove_file(&dp("/a.txt")).await.unwrap();
+        let stats = fs.gc().unwrap();
+        assert_eq!(stats.blobs_removed, 0);
+        // The surviving file still reads back correctly.
+        assert_eq!(
+            read_file(&fs, "/b.txt").await,
+            b"shared content that both files hold"
+        );
+
+        // Deleting the last referencer frees the blobs.
+        fs.remove_file(&dp("/b.txt")).await.unwrap();
+        assert!(fs.gc().unwrap().blobs_removed > 0);
+        assert_eq!(fs.gc().unwrap().bytes_reclaimed, 0); // idempotent afterward
     }
 
     #[tokio::test]

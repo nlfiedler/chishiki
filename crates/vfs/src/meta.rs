@@ -8,6 +8,7 @@
 //! content-addressed storage, and version history. Unchanged chunks are shared
 //! across versions, so keeping history is cheap.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -524,6 +525,26 @@ impl MetaStore {
             return Err(MetaError::NotFound);
         }
         Ok(())
+    }
+
+    /// The set of chunk hashes referenced by any version of any file.
+    ///
+    /// This is the *live set* for blob garbage collection: a blob whose hash is
+    /// absent here is referenced by no version and can be reclaimed. Pruning a
+    /// version or deleting a file removes its `version_chunks` rows (by cascade),
+    /// so those chunks drop out of this set once nothing else shares them.
+    ///
+    /// Hashes are parsed to [`Hash`] here (once), so the GC sweep can probe the
+    /// set by value without formatting each on-disk blob's hash back to hex.
+    pub fn referenced_chunk_hashes(&self) -> Result<HashSet<Hash>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT DISTINCT hash FROM version_chunks")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut set = HashSet::new();
+        for row in rows {
+            set.insert(row?.parse::<Hash>().map_err(|_| MetaError::Corrupt)?);
+        }
+        Ok(set)
     }
 
     /// Set a node's last-modified time.

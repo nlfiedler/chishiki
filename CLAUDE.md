@@ -7,18 +7,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Rust** project, built as a **Cargo workspace**. Phases 0 (workspace &
 toolchain), 1 (content-addressable blob store + FastCDC chunker), 2 (virtualized
 filesystem + working WebDAV server), 3 (auto-versioning), 4 (browser web
-interface, incl. a two-pane Bulma UI), and 5 (full-text search) are complete. See
+interface, incl. a two-pane Bulma UI), and 5 (full-text search) are complete, and
+Phase 6 (hardening) is underway — chunk garbage collection has landed. See
 `docs/specs/0001-initial-build-plan.md` for the phased plan,
 `docs/specs/0002-web-interface.md` + `docs/specs/0003-web-ui.md` for the
-web-interface design, and `docs/specs/0004-search.md` for the search design.
+web-interface design, `docs/specs/0004-search.md` for the search design, and
+`docs/specs/0005-chunk-gc.md` for garbage collection.
 
 Layout:
 
-- `crates/blobstore` — content-addressable blob store; blake3-keyed blobs + FastCDC file manifests (Phase 1 ✓)
+- `crates/blobstore` — content-addressable blob store; blake3-keyed blobs + FastCDC file manifests; `list_hashes`/`remove` for chunk GC (Phases 1, 6 ✓)
 - `crates/chunker` — FastCDC content-defined chunking (Phase 1 ✓)
 - `crates/vfs` — virtualized filesystem: SQLite (`rusqlite`) metadata store with immutable per-file version history, + the `dav-server` `DavFileSystem`/`DavFile`/`DavMetaData` traits over the blob store (Phases 2–3 ✓)
 - `crates/index` — reverse (inverted) full-text index, `tantivy`; keyed by node id + tokenized body (Phase 5 ✓)
-- `crates/webdav-server` — the WebDAV/HTTP binary; axum router in front of `dav-server`'s `DavHandler` + `MemLs`, backed by `vfs::DavFs`; version-history endpoints and the browser layer (own directory index, per-file version pages with revert/prune, Markdown rendering) in the `web` module (Phases 2–4 ✓)
+- `crates/webdav-server` — the WebDAV/HTTP binary; axum router in front of `dav-server`'s `DavHandler` + `MemLs`, backed by `vfs::DavFs`; version-history endpoints, the browser layer (own directory index, per-file version pages with revert/prune, Markdown rendering) in the `web` module, full-text search (`GET …?q=` + the `SEARCH` method), and the `POST /?gc` admin endpoint (Phases 2–6 ✓)
 
 The library crates are WebDAV-agnostic so the storage engine ships without
 dragging WebDAV along.
@@ -92,9 +94,9 @@ extension and range/seek for the raw bytes underneath.
 N's manifest as a new version, non-destructive) and `POST /file?prune=N`
 (`DavFs::prune_version` — deletes a non-current version's metadata; refuses the
 current version). Both 303-redirect back to the version page. **Prune frees
-version metadata only; blobs are reclaimed at chunk GC (Phase 6).** Content
-upload/move/delete stays WebDAV-only. AuthN/AuthZ is Phase 6 — until then these
-writes are unauthenticated (trusted-network assumption).
+version metadata only; the freed blobs are reclaimed by chunk GC (see below).**
+Content upload/move/delete stays WebDAV-only. AuthN/AuthZ is Phase 6 — until then
+these writes are unauthenticated (trusted-network assumption).
 
 `read_current`/`read_version` reconstruct into memory (capped); the streaming
 owned-reader is the deferred TODO.
@@ -126,6 +128,33 @@ text content, kept in sync from the `vfs` write path; the router exposes it. See
   `DASL: <DAV:basicsearch>`. AND-by-default grammar; a malformed query is a 400.
 - Deferred (Phase 6): startup reindex of pre-existing content, batched commits,
   ranking/analyzer tuning, the full DASL predicate grammar, auth on search.
+
+**Chunk GC (Phase 6).** Blobs were previously only ever added; **mark-and-sweep**
+GC now reclaims chunks no version references. See `docs/specs/0005-chunk-gc.md`.
+- **Mark**: `MetaStore::referenced_chunk_hashes` (`SELECT DISTINCT hash FROM
+  version_chunks`) = the live set. **Sweep**: `BlobStore::list_hashes` enumerates
+  `<root>/<xx>/<hex>` (temp files skipped) and `BlobStore::remove` deletes any
+  blob not in the live set. `DavFs::gc` orchestrates and returns `GcStats
+  {blobs_scanned, blobs_removed, bytes_reclaimed}`. Also reclaims blobs orphaned
+  by a write that stored chunks but failed before referencing them.
+- **Concurrency**: an in-process `Inner::gc_lock` (`RwLock`). **Every write that
+  adds a chunk reference** holds a **shared** guard across its confirm-then-record
+  span: `FileHandle::flush` (`store_file` + `set_file_content`) and the
+  reference-only `DavFs::copy`/`revert_to_version` (via `Inner::reference_under_guard`).
+  `gc` holds the **exclusive** guard across mark+sweep. Guarding only `store_file`
+  is *not* enough — a concurrent `remove_file`/`prune` can strand a chunk that
+  `copy`/`revert` is mid-way through re-referencing. Reads add no references, so
+  they need no guard (but a read of a concurrently-pruned+GC'd version can fail
+  mid-stream — never corruption). The guard is **in-process**: run GC in the
+  server process, not a second process on the same live data dir. The exclusive
+  guard spans the whole O(#blobs) sweep, so writes block for a GC run
+  (operator-triggered, personal scale — incremental GC is deferred).
+- **Trigger**: `POST /?gc` (store-wide, root path only; returns
+  `{scanned,removed,reclaimed,failed}` JSON — an undeletable blob is counted in
+  `failed` and skipped, not fatal), alongside `?revert`/`?prune`, sharing their
+  CSRF Origin check; currently unauthenticated (trusted-network). Deferred:
+  scheduled/automatic GC, incremental sweeps, a dry-run/audit log, SQLite
+  `VACUUM`/index compaction, cross-process GC, auth.
 
 Toolchain is pinned by `rust-toolchain.toml` (Rust **1.96.0**, edition **2024**,
 with `rustfmt` + `clippy`).

@@ -297,7 +297,8 @@ pub(crate) fn version_main(name: &str, versions: &[VersionInfo]) -> String {
         "<h1 class=\"title is-5\">Versions of {name}</h1>\
          <p class=\"buttons\"><a class=\"button is-small\" href=\"{view_href}\">view current</a></p>\
          <p class=\"notification is-warning is-light\">Deleting a version removes it from \
-         history but does not reclaim disk space until garbage collection (a later phase).</p>\
+         history; the chunks it no longer shares stay on disk until garbage collection is \
+         run (<code>POST /?gc</code>).</p>\
          <table class=\"table is-fullwidth\"><thead><tr>\
          <th>Version</th><th>Size</th><th>Created</th><th>Actions</th></tr></thead>\
          <tbody>{rows}</tbody></table>"

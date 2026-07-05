@@ -160,6 +160,69 @@ impl BlobStore {
     pub fn open_file<'a>(&'a self, manifest: &'a Manifest) -> ManifestReader<'a> {
         ManifestReader::new(self, manifest)
     }
+
+    /// Enumerate the hashes of every blob currently stored.
+    ///
+    /// Scans the two-level `<root>/<xx>/<hex>` layout, yielding each *regular
+    /// file* whose name parses as a [`Hash`]. In-progress temp files (which live
+    /// directly under the root, not in a shard directory), directories, and any
+    /// other stray entry are skipped, so the result is exactly the set of
+    /// committed blobs. Intended for garbage collection (mark-and-sweep against
+    /// the set of referenced hashes).
+    ///
+    /// Best-effort per entry: an unreadable shard or entry is skipped rather than
+    /// aborting the whole scan — under-reporting a blob only defers its
+    /// reclamation (conservative/safe), so one bad entry can't stall GC forever.
+    /// Only a failure to read the store root itself is propagated.
+    pub fn list_hashes(&self) -> io::Result<Vec<Hash>> {
+        let mut hashes = Vec::new();
+        for shard in fs::read_dir(&self.root)? {
+            let Ok(shard) = shard else { continue };
+            // Only shard *directories* hold blobs; skip temp files at the root
+            // and any entry whose type can't be read.
+            if !shard.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(shard.path()) else {
+                continue;
+            };
+            for blob in entries {
+                let Ok(blob) = blob else { continue };
+                // A blob is always a regular file; skip a hash-named directory or
+                // anything else that isn't one (it must never reach `remove`).
+                if !blob.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                if let Some(name) = blob.file_name().to_str()
+                    && let Ok(hash) = name.parse::<Hash>()
+                {
+                    hashes.push(hash);
+                }
+            }
+        }
+        Ok(hashes)
+    }
+
+    /// Delete the blob with the given hash, returning the number of bytes freed.
+    ///
+    /// Returns `Ok(0)` if the blob is already absent (idempotent). Callers must
+    /// ensure the blob is unreferenced — deleting a referenced blob corrupts the
+    /// files that depend on it. The (possibly now-empty) shard directory is left
+    /// in place, since a concurrent writer may be about to reuse it.
+    pub fn remove(&self, hash: &Hash) -> io::Result<u64> {
+        let path = self.blob_path(hash);
+        let size = match fs::metadata(&path) {
+            Ok(meta) => meta.len(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(size),
+            // Lost a race with another remover; treat as already freed.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -188,21 +251,9 @@ mod tests {
         out
     }
 
-    /// Count the blob files under the store root (excludes empty shard dirs).
+    /// Count the committed blobs under the store root (via the production scan).
     fn count_blobs(store: &BlobStore) -> usize {
-        fn walk(dir: &Path, count: &mut usize) {
-            for entry in fs::read_dir(dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    walk(&path, count);
-                } else {
-                    *count += 1;
-                }
-            }
-        }
-        let mut count = 0;
-        walk(store.root(), &mut count);
-        count
+        store.list_hashes().unwrap().len()
     }
 
     #[test]
@@ -284,6 +335,32 @@ mod tests {
         let m2 = store.store_file(data.as_slice(), cfg).unwrap();
         assert_eq!(m1, m2);
         assert_eq!(count_blobs(&store), unique_chunks.len());
+    }
+
+    #[test]
+    fn list_hashes_enumerates_stored_blobs() {
+        let (_dir, store) = temp_store();
+        let h1 = store.put(b"alpha").unwrap();
+        let h2 = store.put(b"beta").unwrap();
+        store.put(b"alpha").unwrap(); // dedup — still one blob
+
+        let listed: HashSet<Hash> = store.list_hashes().unwrap().into_iter().collect();
+        assert_eq!(listed, HashSet::from([h1, h2]));
+        // An in-progress temp file at the root must not be listed as a blob.
+        NamedTempFile::new_in(store.root()).unwrap();
+        assert_eq!(store.list_hashes().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn remove_frees_the_blob_and_reports_size() {
+        let (_dir, store) = temp_store();
+        let hash = store.put(b"remove me").unwrap();
+        assert!(store.has(&hash));
+
+        assert_eq!(store.remove(&hash).unwrap(), b"remove me".len() as u64);
+        assert!(!store.has(&hash));
+        // Removing an absent blob is an idempotent no-op reporting zero bytes.
+        assert_eq!(store.remove(&hash).unwrap(), 0);
     }
 
     #[test]
