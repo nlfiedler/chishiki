@@ -1,0 +1,10 @@
+# Keep the build context small and reproducible. `target/` and `data/` are the
+# big, machine-local directories that must never leak into the image (the build
+# stage produces its own target; `data/` is a runtime volume).
+target/
+data/
+.git/
+.github/
+docs/
+scripts/
+*.md

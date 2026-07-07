@@ -26,8 +26,8 @@ accessible both from a browser and via WebDAV clients. Use cases include:
 
 ## How to Use
 
-The server currently runs from the source tree. (Docker images and deployment
-will come later.)
+Run the server [from the source tree](#build-and-run) with a Rust toolchain, or
+[with Docker](#run-with-docker) using the provided `Dockerfile`.
 
 ### Prerequisites
 
@@ -70,6 +70,32 @@ CHISHIKI_ADDR=0.0.0.0:8080 CHISHIKI_DATA=/srv/chishiki cargo run --release -p we
 
 > **Note:** there is no authentication yet. Bind to `127.0.0.1` (the default) or
 > otherwise restrict access to a trusted network.
+
+### Run with Docker
+
+A multi-stage `Dockerfile` builds the server and produces a slim runtime image
+that runs as a non-root user. No local Rust or C toolchain is required — the
+build stage supplies both.
+
+```sh
+# Build the image:
+docker build -t chishiki .
+
+# Run it, publishing the port and persisting data in a named volume:
+docker run -d --name chishiki -p 4918:4918 -v chishiki-data:/data chishiki
+```
+
+Then browse to <http://127.0.0.1:4918/>. The container defaults differ from the
+from-source defaults so it works out of the box:
+
+* `CHISHIKI_ADDR` defaults to `0.0.0.0:4918` (rather than `127.0.0.1:4918`) so
+  the server is reachable through the published port. Access is still gated by
+  Docker's port publishing — bind the host side to a trusted interface (e.g.
+  `-p 127.0.0.1:4918:4918`) since there is no authentication yet.
+* `CHISHIKI_DATA` defaults to `/data`, exposed as a volume so the blob store,
+  metadata database, and search index survive container restarts.
+
+Override either with `-e`, e.g. `docker run -e CHISHIKI_ADDR=0.0.0.0:8080 …`.
 
 ### Accessing the server
 
