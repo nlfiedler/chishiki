@@ -102,9 +102,10 @@ returns an HTML page (revert/delete buttons that `POST ?revert=N` / `?prune=N`,
    (revert/prune) is a browser-initiated write — an intentional, explicit
    exception, not general write access. Content upload/move/delete remains
    WebDAV-only.
-4. **AuthN/AuthZ is Phase 6.** Until then the interface (including revert/prune)
-   is unauthenticated — acceptable only on a trusted personal network. Version
-   management should be gated behind auth when Phase 6 lands.
+4. **AuthN/AuthZ is standalone future work, not a phase** (see
+   `0001-initial-build-plan.md` → "Future work"). Until then the interface
+   (including revert/prune) is unauthenticated — acceptable only on a trusted
+   personal network. Version management should be gated behind auth when it lands.
 5. **No schema change.** The Phase-3 `versions`/`version_chunks` model already
    supports revert (append) and prune (delete rows).
 

@@ -96,8 +96,9 @@ N's manifest as a new version, non-destructive) and `POST /file?prune=N`
 (`DavFs::prune_version` — deletes a non-current version's metadata; refuses the
 current version). Both 303-redirect back to the version page. **Prune frees
 version metadata only; the freed blobs are reclaimed by chunk GC (see below).**
-Content upload/move/delete stays WebDAV-only. AuthN/AuthZ is Phase 6 — until then
-these writes are unauthenticated (trusted-network assumption).
+Content upload/move/delete stays WebDAV-only. AuthN/AuthZ is cross-cutting future
+work, not tied to a phase (see `docs/specs/0001-initial-build-plan.md` → "Future
+work") — until then these writes are unauthenticated (trusted-network assumption).
 
 `read_current`/`read_version` reconstruct into memory (capped); the streaming
 owned-reader is the deferred TODO.
@@ -128,7 +129,8 @@ text content, kept in sync from the `vfs` write path; the router exposes it. See
   literal), answered as a `207 Multi-Status`; `OPTIONS` advertises
   `DASL: <DAV:basicsearch>`. AND-by-default grammar; a malformed query is a 400.
 - Deferred (Phase 6): startup reindex of pre-existing content, batched commits,
-  ranking/analyzer tuning, the full DASL predicate grammar, auth on search.
+  ranking/analyzer tuning, the full DASL predicate grammar. (Auth on search is
+  part of the standalone AuthN/AuthZ future work, not a phase.)
 
 **Chunk GC (Phase 6).** Blobs were previously only ever added; **mark-and-sweep**
 GC now reclaims chunks no version references. See `docs/specs/0005-chunk-gc.md`.
@@ -153,9 +155,10 @@ GC now reclaims chunks no version references. See `docs/specs/0005-chunk-gc.md`.
 - **Trigger**: `POST /?gc` (store-wide, root path only; returns
   `{scanned,removed,reclaimed,failed}` JSON — an undeletable blob is counted in
   `failed` and skipped, not fatal), alongside `?revert`/`?prune`, sharing their
-  CSRF Origin check; currently unauthenticated (trusted-network). Deferred:
+  CSRF Origin check; currently unauthenticated (trusted-network; auth is the
+  standalone AuthN/AuthZ future work, not a phase). Deferred:
   scheduled/automatic GC, incremental sweeps, a dry-run/audit log, SQLite
-  `VACUUM`/index compaction, cross-process GC, auth.
+  `VACUUM`/index compaction, cross-process GC.
 
 Toolchain is pinned by `rust-toolchain.toml` (Rust **1.96.0**, edition **2024**,
 with `rustfmt` + `clippy`).

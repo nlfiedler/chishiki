@@ -82,7 +82,8 @@ Store-wide, path-independent. Runs `DavFs::gc()` on a blocking task and returns
 `{"scanned":N,"removed":N,"reclaimed":BYTES}`. It sits alongside the existing
 version-management writes (`?revert`/`?prune`) and shares their **CSRF Origin
 check**; like them it is currently **unauthenticated** (trusted-network
-assumption — auth is a separate Phase 6 item). The per-file version page's copy
+assumption — auth is standalone future work, not a phase; see
+`0001-initial-build-plan.md` → "Future work"). The per-file version page's copy
 now says pruned chunks are reclaimed "the next time garbage collection runs."
 
 ## Decisions
@@ -108,4 +109,5 @@ now says pruned chunks are reclaimed "the next time garbage collection runs."
 - Compaction of the search index or SQLite (`VACUUM`); this reclaims blob files
   only. Pruned index docs are already reconciled lazily (see 0004).
 - Cross-process GC (a filesystem lock so an offline CLI could run safely).
-- Auth on the GC endpoint (shares the Phase-6 auth story).
+- Auth on the GC endpoint (part of the standalone AuthN/AuthZ future work, not a
+  phase — see `0001-initial-build-plan.md` → "Future work").

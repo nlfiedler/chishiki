@@ -91,9 +91,10 @@ without dragging WebDAV along.
   interceptor in the router for RFC 5323 clients.
 
 ### Phase 6 — Hardening
-- AuthN/AuthZ (`GuardedFileSystem` for access control), chunk GC, locking/
-  concurrency correctness, large-file streaming, integration tests against real
-  WebDAV clients, and benchmarks.
+- Chunk GC, locking/concurrency correctness, large-file streaming, integration
+  tests against real WebDAV clients, and benchmarks.
+- **AuthN/AuthZ is _not_ part of this (or any) phase** — it is a cross-cutting
+  concern tracked under "Future work" below.
 
 ## Resolved decisions
 1. **Metadata engine** (Phase 2): **SQLite via `rusqlite`.** `sled` has had very
@@ -118,3 +119,37 @@ without dragging WebDAV along.
    history is instead delivered via the browser UI and the `?versions` /
    `?version=N` / `?revert` / `?prune` endpoints. RFC 3253 remains a reference/
    inspiration only. _Resolved 2026-07-06._
+
+## Future work (not tied to a phase)
+
+### AuthN/AuthZ
+
+Authentication and authorization is a **cross-cutting** concern, deliberately
+**not** attached to any phase: when it lands it gates every surface at once —
+the WebDAV method set, the browser pages, the `?q=` search surfaces, and the
+currently-unauthenticated `?revert` / `?prune` / `?gc` POST writes. Until then
+the server ships **unauthenticated** and must be bound to `127.0.0.1` or an
+otherwise trusted network (see `README.md`).
+
+**Usage model.** Chishiki is a personal server that runs on a home LAN and is
+used by **anyone in the household** — so this is genuinely **multi-user**, but
+the population is small, trusted, and **not internet-facing** (no adversarial
+threat model, no public exposure). That shapes, but does not yet decide, the
+design:
+
+- **Mechanism must serve WebDAV clients and browsers over the same URLs.** Finder
+  / Windows / `rclone` / `davfs2` speak **HTTP Basic** (and legacy Digest)
+  natively but have no cookie/form-login concept; browsers can do Basic (native
+  dialog, no logout) or a nicer cookie session. **Basic** is the common
+  denominator, which in turn wants **TLS** so LAN credentials aren't sent in the
+  clear even on a trusted network.
+- **AuthZ is likely coarse to start** — "authenticated ⇒ access", possibly
+  read-only vs. read-write, or per-user home subtrees — not fine-grained ACLs.
+  `dav-server`'s `GuardedFileSystem` is the access-control hook.
+- **Open questions** (to resolve when we build it, not now): shared credential
+  vs. per-user accounts; where credentials live (config file, SQLite, env);
+  whether to require TLS or leave it to a reverse proxy; session handling for the
+  browser surface; and how CSRF protection on the POST writes interacts with an
+  auth scheme.
+
+A dedicated design spec will be written when this is picked up.

@@ -111,4 +111,5 @@ full-text index can meaningfully answer:
 - Batched/asynchronous commits; a background index-maintenance task.
 - Ranking tuning, per-field boosts, stemming/language analyzers, faceting.
 - Full DASL predicate grammar (property comparisons, `DAV:and`/`DAV:or` trees).
-- Auth on the search surfaces (shares the Phase-6 auth story).
+- Auth on the search surfaces (part of the standalone AuthN/AuthZ future work,
+  not a phase — see `0001-initial-build-plan.md` → "Future work").
