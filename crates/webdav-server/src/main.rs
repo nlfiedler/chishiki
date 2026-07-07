@@ -67,7 +67,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(Extension(fs));
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("chishiki webdav-server listening on http://{addr} (data dir: {data_dir})");
+    // Report the *actual* bound address (not the requested one), so binding port
+    // 0 reveals the OS-assigned port — useful for ops and required for tests that
+    // spawn the server on an ephemeral port.
+    let bound = listener.local_addr()?;
+    println!("chishiki webdav-server listening on http://{bound} (data dir: {data_dir})");
     // On Ctrl-C / SIGTERM, stop accepting connections and let in-flight requests
     // finish before exiting. Completed writes are already durable (fsync'd blobs +
     // committed SQLite transactions); this drains in-progress ones and lets temp

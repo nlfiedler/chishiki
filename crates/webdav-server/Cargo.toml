@@ -20,5 +20,12 @@ percent-encoding.workspace = true
 # Parses RFC 5323 SEARCH request bodies (DAV:basicsearch) in the router.
 quick-xml.workspace = true
 
+[dev-dependencies]
+# Integration tests spawn the real binary and drive it over HTTP. reqwest with
+# no default features = a plain-HTTP client (no TLS backend), able to send
+# arbitrary WebDAV methods and read status/headers/bytes.
+reqwest = { version = "0.12", default-features = false }
+tempfile.workspace = true
+
 [lints]
 workspace = true

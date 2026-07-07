@@ -8,12 +8,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 toolchain), 1 (content-addressable blob store + FastCDC chunker), 2 (virtualized
 filesystem + working WebDAV server), 3 (auto-versioning), 4 (browser web
 interface, incl. a two-pane Bulma UI), and 5 (full-text search) are complete, and
-Phase 6 (hardening) is underway — chunk garbage collection and large-file
-version streaming have landed. See
+Phase 6 (hardening) is underway — chunk garbage collection, large-file
+version streaming, and a black-box integration-test harness have landed. See
 `docs/specs/0001-initial-build-plan.md` for the phased plan,
 `docs/specs/0002-web-interface.md` + `docs/specs/0003-web-ui.md` for the
 web-interface design, `docs/specs/0004-search.md` for the search design,
-`docs/specs/0005-chunk-gc.md` for garbage collection, and
+`docs/specs/0005-chunk-gc.md` for garbage collection,
+`docs/specs/0007-integration-tests.md` for the integration harness, and
 `docs/specs/0006-large-file-streaming.md` for version streaming.
 
 Layout:
@@ -180,6 +181,11 @@ with `rustfmt` + `clippy`).
 - Test (all): `cargo test --workspace`
 - Test a single crate: `cargo test -p <crate>` (e.g. `cargo test -p blobstore`)
 - Test a single test by name: `cargo test -p <crate> <test_name>`
+- Integration tests (black-box, spawn the real binary over HTTP):
+  `cargo test -p webdav-server --test webdav` — the `TestServer` harness in
+  `crates/webdav-server/tests/` boots the binary on an ephemeral port with a temp
+  data dir and drives it with the WebDAV method set (see 0007). No external
+  WebDAV client is required.
 - Format: `cargo fmt --all` (check-only: `cargo fmt --all --check`)
 - Lint: `cargo clippy --workspace --all-targets -- -D warnings`
 
