@@ -39,6 +39,10 @@ pub struct Manifest {
 /// reconstructing a large file never holds more than a single chunk in memory.
 /// [`Seek`] uses the per-chunk offsets recorded in the manifest to jump directly
 /// to the chunk containing the target position.
+///
+/// This borrows the store and manifest, so it's for reconstructing within a
+/// single call. To hand a reader across threads or into a response body, use the
+/// owned, forward-only [`ChunkStream`] instead.
 #[derive(Debug)]
 pub struct ManifestReader<'a> {
     store: &'a BlobStore,
@@ -143,5 +147,50 @@ impl Seek for ManifestReader<'_> {
         self.base = chunk.offset;
         self.next_index = idx + 1;
         Ok(target)
+    }
+}
+
+/// A `Send + 'static`, forward-only stream of a file's chunks, one owned buffer
+/// at a time.
+///
+/// Owns a clone of the [`BlobStore`] handle (cheap — just the root path) and the
+/// [`Manifest`], so it borrows nothing and can move into a `spawn_blocking`
+/// closure or back a streamed HTTP response body. Each
+/// [`next_chunk`](Self::next_chunk) hands back one chunk's bytes **with no extra
+/// copy** (the blob read is yielded directly), so serving a file — or a
+/// historical version — of any size never buffers more than a single chunk.
+/// Produced by [`BlobStore::stream_chunks`].
+#[derive(Debug)]
+pub struct ChunkStream {
+    store: BlobStore,
+    manifest: Manifest,
+    /// Index of the next chunk to yield.
+    next: usize,
+}
+
+impl ChunkStream {
+    pub(crate) fn new(store: BlobStore, manifest: Manifest) -> Self {
+        Self {
+            store,
+            manifest,
+            next: 0,
+        }
+    }
+
+    /// Total size of the reconstructed file in bytes.
+    pub fn total_size(&self) -> u64 {
+        self.manifest.total_size
+    }
+
+    /// The next chunk's bytes, or `None` once every chunk has been yielded.
+    ///
+    /// The returned `Vec` is the blob read directly — no intermediate copy. A
+    /// per-chunk I/O error (e.g. a blob missing because it was concurrently
+    /// garbage-collected) is surfaced as `Some(Err(_))`, after which the caller
+    /// should stop.
+    pub fn next_chunk(&mut self) -> Option<io::Result<Vec<u8>>> {
+        let chunk = self.manifest.chunks.get(self.next)?;
+        self.next += 1;
+        Some(self.store.get(&chunk.hash))
     }
 }

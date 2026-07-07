@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use blobstore::{BlobStore, Manifest};
+use blobstore::{BlobStore, ChunkStream, Manifest};
 use chunker::ChunkerConfig;
 use dav_server::davpath::DavPath;
 use dav_server::fs::{
@@ -275,15 +275,38 @@ impl DavFs {
             .collect())
     }
 
-    /// Read the full content of a specific version (by 1-based number) of the
-    /// file at `path`.
+    /// Open an owned streaming reader over a specific version (by 1-based number)
+    /// of the file at `path`.
     ///
-    /// The version is reconstructed **into memory**, so it is capped at
-    /// [`MAX_IN_MEMORY_VERSION`]; larger historical versions return
-    /// [`VfsError::TooLarge`].
-    // TODO(phase-later): replace this with an owned streaming reader shared with
-    // the live GET path (`FileHandle`), so historical versions of any size stream
-    // chunk-by-chunk instead of being buffered.
+    /// The returned [`VersionReader`] fetches chunks lazily, one at a time, so a
+    /// historical version of **any size** streams with bounded memory — there is
+    /// no in-memory cap. It is `Send + 'static`, so the router can move it into a
+    /// `spawn_blocking` and stream it as the response body (see
+    /// `docs/specs/0006-large-file-streaming.md`). Only cheap metadata work
+    /// happens here; no blob bytes are read until the reader is polled.
+    ///
+    /// Like the live read path, this holds no GC guard: a version that is
+    /// concurrently pruned *and* garbage-collected while being streamed can fail
+    /// mid-read — a failed read, never corruption (see 0005 / 0006).
+    pub fn open_version(&self, path: &DavPath, number: u64) -> Result<VersionReader, VfsError> {
+        let node = self.resolve_file(path)?;
+        let version = self.inner.meta.version_by_number(node.id, number)?;
+        let manifest = self.inner.meta.load_version_manifest(version.id)?;
+        Ok(VersionReader {
+            size: version.size,
+            chunks: self.inner.blobs.stream_chunks(manifest),
+        })
+    }
+
+    /// Read the full content of a specific version (by 1-based number) of the
+    /// file at `path` **into memory**.
+    ///
+    /// A convenience for in-memory callers; because it buffers, it is capped at
+    /// [`MAX_IN_MEMORY_VERSION`] and returns [`VfsError::TooLarge`] above that.
+    /// To serve a version of any size, stream it with [`open_version`] instead
+    /// (that is what the HTTP `?version=N` path does).
+    ///
+    /// [`open_version`]: Self::open_version
     pub fn read_version(&self, path: &DavPath, number: u64) -> Result<Vec<u8>, VfsError> {
         let node = self.resolve_file(path)?;
         let version = self.inner.meta.version_by_number(node.id, number)?;
@@ -506,9 +529,39 @@ pub struct DirEntryInfo {
     pub modified: SystemTime,
 }
 
-/// Upper bound on a historical version served in memory by [`DavFs::read_version`]
-/// (256 MiB). Guards against OOM until history streaming lands.
+/// Upper bound on a historical version buffered in memory by the *convenience*
+/// [`DavFs::read_version`] (256 MiB). The HTTP `?version=N` path streams via
+/// [`DavFs::open_version`] and has no such cap.
 pub const MAX_IN_MEMORY_VERSION: u64 = 256 * 1024 * 1024;
+
+/// An owned, streaming reader over one historical file version.
+///
+/// Wraps a [`ChunkStream`] (which yields the version's chunks lazily, one owned
+/// buffer at a time with no extra copy) and carries the version's total size for
+/// a `Content-Length`. It is `Send + 'static`, so it can be moved into a blocking
+/// task and streamed as an HTTP body without ever buffering the whole version.
+/// Produced by [`DavFs::open_version`].
+#[derive(Debug)]
+pub struct VersionReader {
+    size: u64,
+    chunks: ChunkStream,
+}
+
+impl VersionReader {
+    /// Total size of the version in bytes (the `Content-Length` to advertise).
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// The next chunk's bytes, or `None` once the whole version has been yielded.
+    ///
+    /// Does blocking blob I/O — call it from a blocking context. A per-chunk error
+    /// (e.g. a blob concurrently garbage-collected mid-stream) is surfaced as
+    /// `Some(Err(_))`, after which the caller should stop.
+    pub fn next_chunk(&mut self) -> Option<std::io::Result<Vec<u8>>> {
+        self.chunks.next_chunk()
+    }
+}
 
 /// A single entry in a file's version history, as surfaced by
 /// [`DavFs::list_versions`].
@@ -965,9 +1018,14 @@ impl VfsError {
         matches!(self, VfsError::Meta(MetaError::NotFound))
     }
 
-    /// Whether this error is "too large" (so the router can return 413).
-    pub fn is_too_large(&self) -> bool {
-        matches!(self, VfsError::TooLarge(_))
+    /// Whether this error is the caller naming an unsuitable target — e.g. asking
+    /// for a version of a directory (so the router can return 400 rather than
+    /// masking it as a 500 server fault).
+    pub fn is_invalid_target(&self) -> bool {
+        matches!(
+            self,
+            VfsError::Meta(MetaError::IsADirectory | MetaError::NotADirectory)
+        )
     }
 
     /// Whether this error is a malformed user search query (so the router can
@@ -1233,6 +1291,43 @@ mod tests {
         // Requesting a non-existent version number is not found.
         write_file(&fs, "/f", b"data").await;
         assert!(fs.read_version(&dp("/f"), 5).unwrap_err().is_not_found());
+    }
+
+    #[tokio::test]
+    async fn open_version_streams_content_chunk_by_chunk() {
+        let (_dir, fs) = temp_fs();
+        // A ~1 MiB, non-constant body so it splits into several chunks and the
+        // stream actually walks chunk-to-chunk (not one blob).
+        let big: Vec<u8> = (0..1_000_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        write_file(&fs, "/big.bin", &big).await;
+        // A second, smaller write so version 1 is historical, not current.
+        write_file(&fs, "/big.bin", b"small current").await;
+
+        let mut reader = fs.open_version(&dp("/big.bin"), 1).unwrap();
+        assert_eq!(reader.size(), big.len() as u64);
+
+        // Streaming every chunk reconstructs the exact bytes — with no in-memory
+        // cap (this path has no MAX_IN_MEMORY_VERSION check) and more than one
+        // chunk (so it exercises the multi-chunk walk).
+        let mut out = Vec::new();
+        let mut chunks = 0;
+        while let Some(chunk) = reader.next_chunk() {
+            out.extend_from_slice(&chunk.unwrap());
+            chunks += 1;
+        }
+        assert_eq!(out, big);
+        assert!(chunks > 1, "expected a multi-chunk version, got {chunks}");
+    }
+
+    #[tokio::test]
+    async fn open_version_missing_is_not_found() {
+        let (_dir, fs) = temp_fs();
+        write_file(&fs, "/f", b"data").await;
+        // Non-existent version number, and non-existent path.
+        assert!(fs.open_version(&dp("/f"), 5).unwrap_err().is_not_found());
+        assert!(fs.open_version(&dp("/nope"), 1).unwrap_err().is_not_found());
     }
 
     #[tokio::test]

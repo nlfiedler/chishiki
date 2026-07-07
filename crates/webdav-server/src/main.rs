@@ -20,6 +20,7 @@ mod web;
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::body::{Body, Bytes};
 use axum::extract::Request;
 use axum::http::{Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -334,21 +335,64 @@ fn parent_sidebar(fs: &DavFs, path_str: &str, current_file: &str) -> String {
     }
 }
 
-/// `GET /path?version=N` → the raw bytes of version N.
+/// Number of reconstructed chunks buffered in flight while streaming a version.
+/// A small bound gives read-ahead without unbounded memory — `blocking_send`
+/// parks the producer when the client falls behind (backpressure).
+const VERSION_STREAM_CHUNKS: usize = 4;
+
+/// `GET /path?version=N` → version N's bytes, **streamed** chunk-by-chunk.
+///
+/// Opening the reader is cheap metadata work (run off the async worker); the
+/// version's chunks are then pulled lazily so a version of any size streams with
+/// bounded memory (no in-memory cap, hence no 413). See
+/// `docs/specs/0006-large-file-streaming.md`.
 async fn serve_version(fs: DavFs, path: DavPath, number: u64) -> Response {
-    // read_version reconstructs the whole version (blocking blob reads), so run
-    // it off the async worker.
-    match tokio::task::spawn_blocking(move || fs.read_version(&path, number)).await {
-        Ok(Ok(bytes)) => {
-            ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response()
-        }
+    let mut reader = match tokio::task::spawn_blocking(move || fs.open_version(&path, number)).await
+    {
+        Ok(Ok(reader)) => reader,
         Ok(Err(e)) if e.is_not_found() => {
-            (StatusCode::NOT_FOUND, "version not found").into_response()
+            return (StatusCode::NOT_FOUND, "version not found").into_response();
         }
-        Ok(Err(e)) if e.is_too_large() => {
-            (StatusCode::PAYLOAD_TOO_LARGE, "version too large to serve").into_response()
+        // The path resolves but isn't a versioned file (e.g. a directory) — a
+        // client mistake, not a server fault.
+        Ok(Err(e)) if e.is_invalid_target() => {
+            return (StatusCode::BAD_REQUEST, "not a versioned file").into_response();
         }
-        Ok(Err(_)) => (StatusCode::BAD_REQUEST, "not a versioned file").into_response(),
+        // A genuine server fault (corrupt metadata, SQLite/IO error) or a join
+        // failure — a 500, not a misleading 400.
+        Ok(Err(_)) | Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "read failed").into_response();
+        }
+    };
+
+    let size = reader.size();
+    // One blocking task drains the version's chunks into a bounded channel; the
+    // response body streams the receiver. Zero-copy (each chunk's own buffer
+    // becomes a `Bytes`), one blocking dispatch for the whole transfer, and
+    // bounded — `blocking_send` parks the reader when the channel fills.
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(VERSION_STREAM_CHUNKS);
+    tokio::task::spawn_blocking(move || {
+        while let Some(chunk) = reader.next_chunk() {
+            let failed = chunk.is_err();
+            if tx.blocking_send(chunk.map(Bytes::from)).is_err() {
+                break; // client hung up; stop reading
+            }
+            if failed {
+                break; // surfaced the error to the client; stop
+            }
+        }
+    });
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+
+    match Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, size)
+        .body(Body::from_stream(stream))
+    {
+        Ok(resp) => resp,
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "read failed").into_response(),
     }
 }

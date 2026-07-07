@@ -49,7 +49,7 @@ tempfile = "3"
 # DavHandler, MemLs/FakeLs, the fs traits, and DavPath.
 dav-server = { version = "0.11", default-features = false }
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 bytes = "1"
 futures-util = "0.3"

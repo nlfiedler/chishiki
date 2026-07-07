@@ -13,6 +13,7 @@ pub mod meta;
 mod metadata;
 
 pub use davfs::{
-    DavFs, DirEntryInfo, GcStats, MAX_IN_MEMORY_VERSION, SearchResult, VersionInfo, VfsError,
+    DavFs, DirEntryInfo, GcStats, MAX_IN_MEMORY_VERSION, SearchResult, VersionInfo, VersionReader,
+    VfsError,
 };
 pub use meta::{MetaError, MetaStore, Node, ROOT_ID, Version};

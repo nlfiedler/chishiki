@@ -13,6 +13,8 @@ vfs.workspace = true
 dav-server.workspace = true
 axum.workspace = true
 tokio.workspace = true
+# Streams a historical file version's body lazily (try_unfold) in the router.
+futures-util.workspace = true
 pulldown-cmark.workspace = true
 percent-encoding.workspace = true
 # Parses RFC 5323 SEARCH request bodies (DAV:basicsearch) in the router.

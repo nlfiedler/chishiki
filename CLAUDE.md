@@ -8,15 +8,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 toolchain), 1 (content-addressable blob store + FastCDC chunker), 2 (virtualized
 filesystem + working WebDAV server), 3 (auto-versioning), 4 (browser web
 interface, incl. a two-pane Bulma UI), and 5 (full-text search) are complete, and
-Phase 6 (hardening) is underway — chunk garbage collection has landed. See
+Phase 6 (hardening) is underway — chunk garbage collection and large-file
+version streaming have landed. See
 `docs/specs/0001-initial-build-plan.md` for the phased plan,
 `docs/specs/0002-web-interface.md` + `docs/specs/0003-web-ui.md` for the
-web-interface design, `docs/specs/0004-search.md` for the search design, and
-`docs/specs/0005-chunk-gc.md` for garbage collection.
+web-interface design, `docs/specs/0004-search.md` for the search design,
+`docs/specs/0005-chunk-gc.md` for garbage collection, and
+`docs/specs/0006-large-file-streaming.md` for version streaming.
 
 Layout:
 
-- `crates/blobstore` — content-addressable blob store; blake3-keyed blobs + FastCDC file manifests; `list_hashes`/`remove` for chunk GC (Phases 1, 6 ✓)
+- `crates/blobstore` — content-addressable blob store; blake3-keyed blobs + FastCDC file manifests; a borrowed `Read`+`Seek` `ManifestReader` (`open_file`) and an owned, forward-only `ChunkStream` (`stream_chunks`, `Send + 'static`, zero-copy per chunk) reconstruct a file; `list_hashes`/`remove` for chunk GC (Phases 1, 6 ✓)
 - `crates/chunker` — FastCDC content-defined chunking (Phase 1 ✓)
 - `crates/vfs` — virtualized filesystem: SQLite (`rusqlite`) metadata store with immutable per-file version history, + the `dav-server` `DavFileSystem`/`DavFile`/`DavMetaData` traits over the blob store (Phases 2–3 ✓)
 - `crates/index` — reverse (inverted) full-text index, `tantivy`; keyed by node id + tokenized body (Phase 5 ✓)
@@ -50,10 +52,12 @@ exposed by the router (not `dav-server`) as `GET /path?versions` (JSON list) and
 full RFC 3253 Delta-V protocol is deliberately not implemented (no client
 ecosystem — see `docs/specs/0001-initial-build-plan.md`, decision #4).
 
+The HTTP `?version=N` path **streams** a historical version of any size
+(`DavFs::open_version` → an owned `VersionReader`, chunk-by-chunk, bounded
+memory; the router serves it with a `Content-Length` and no 413). See Phase 6
+below and `docs/specs/0006-large-file-streaming.md`.
+
 Known Phase-3 limitations (deferred, not bugs):
-- `DavFs::read_version` reconstructs a historical version **into memory**, capped
-  at `MAX_IN_MEMORY_VERSION` (256 MiB → 413 above that). **TODO:** replace with an
-  owned streaming reader shared with the live GET path so any-size history streams.
 - Version history is reachable only via these `GET` endpoints, so a WebDAV-mounted
   client (Finder/rclone) can't browse it. A virtual `.versions/` namespace would
   close that gap.
@@ -100,8 +104,11 @@ Content upload/move/delete stays WebDAV-only. AuthN/AuthZ is cross-cutting futur
 work, not tied to a phase (see `docs/specs/0001-initial-build-plan.md` → "Future
 work") — until then these writes are unauthenticated (trusted-network assumption).
 
-`read_current`/`read_version` reconstruct into memory (capped); the streaming
-owned-reader is the deferred TODO.
+`DavFs::open_version` streams a historical version of any size via an owned
+`VersionReader` (no cap); `read_version`/`read_current` are the buffered,
+in-memory *convenience* reads (still capped — `read_version` at
+`MAX_IN_MEMORY_VERSION`, `read_current` at the caller's cap, e.g. the small
+browser-preview cap).
 
 **Full-text search (Phase 5).** A **tantivy** reverse index (`crates/index`) over
 text content, kept in sync from the `vfs` write path; the router exposes it. See

@@ -22,7 +22,7 @@ mod hash;
 mod manifest;
 
 pub use hash::{Hash, ParseHashError};
-pub use manifest::{ChunkRef, Manifest, ManifestReader};
+pub use manifest::{ChunkRef, ChunkStream, Manifest, ManifestReader};
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -156,9 +156,21 @@ impl BlobStore {
         Ok(manifest)
     }
 
-    /// A streaming reader that reconstructs a file from its [`Manifest`].
+    /// A streaming reader that reconstructs a file from its [`Manifest`]
+    /// (borrows both; for reconstructing within a single call).
     pub fn open_file<'a>(&'a self, manifest: &'a Manifest) -> ManifestReader<'a> {
         ManifestReader::new(self, manifest)
+    }
+
+    /// A `Send + 'static`, forward-only [`ChunkStream`] that owns the manifest and
+    /// a clone of this store handle (cloning is cheap — just the root path).
+    ///
+    /// Because it borrows nothing, it can move into a `spawn_blocking` closure or
+    /// back a streamed HTTP response body, yielding one chunk at a time with no
+    /// extra copy — the basis for serving a file (or historical version) of any
+    /// size without buffering it into memory.
+    pub fn stream_chunks(&self, manifest: Manifest) -> ChunkStream {
+        ChunkStream::new(self.clone(), manifest)
     }
 
     /// Enumerate the hashes of every blob currently stored.
@@ -361,6 +373,35 @@ mod tests {
         assert!(!store.has(&hash));
         // Removing an absent blob is an idempotent no-op reporting zero bytes.
         assert_eq!(store.remove(&hash).unwrap(), 0);
+    }
+
+    #[test]
+    fn stream_chunks_reconstructs_across_threads() {
+        let (_dir, store) = temp_store();
+        let data = pseudo_random(1_000_000, 7);
+        let manifest = store
+            .store_file(data.as_slice(), ChunkerConfig::default())
+            .unwrap();
+        let chunk_count = manifest.chunks.len();
+        assert!(chunk_count > 1);
+
+        // The stream borrows nothing: it can outlive `manifest` (moved in) and be
+        // moved freely — here into another thread, proving Send + 'static.
+        let handle = std::thread::spawn(move || {
+            let mut stream = store.stream_chunks(manifest);
+            assert_eq!(stream.total_size(), data.len() as u64);
+            let mut back = Vec::new();
+            let mut chunks = 0;
+            while let Some(chunk) = stream.next_chunk() {
+                back.extend_from_slice(&chunk.unwrap());
+                chunks += 1;
+            }
+            (back, chunks, data)
+        });
+        let (back, chunks, data) = handle.join().unwrap();
+        assert_eq!(back, data);
+        // Streamed exactly the manifest's chunks, one owned buffer at a time.
+        assert_eq!(chunks, chunk_count);
     }
 
     #[test]
