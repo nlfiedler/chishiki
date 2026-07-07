@@ -1,12 +1,12 @@
 # Chishiki
 
-Build a WebDAV server with Delta-V auto-versioning, WebDAV Search, and a basic web interface.
+Basic WebDAV server with file auto-versioning, WebDAV Search, and a simple web interface.
 
 ## Features
 
-* When accessed with a browser, render Markdown, display images and videos.
-* Support multiple versions of a document with controls for reverting.
-* Maintain a reverse index for searching documents by query terms.
+* When accessed with a browser, renders Markdown, displays images and videos.
+* Records multiple versions of each file with controls for reverting.
+* Maintains a reverse index for searching textual files by query terms.
 
 ## Objective
 
@@ -14,7 +14,7 @@ The purpose of this project is to build a personal storage server that is
 accessible both from a browser and via WebDAV clients. Use cases include:
 
 * A simplistic wiki in which Markdown files are rendered as HTML.
-* A simple file store for organizing collections of images and videos.
+* A file store for organizing documents and small collections of images and videos.
 * A convenient place to store documents, automatically retaining older copies through auto-versioning.
 
 ## Implementation
@@ -109,6 +109,6 @@ See `CLAUDE.md` for the build/test/lint commands and the design overview, and
 ## References
 
 * [WebDAV](http://www.webdav.org)
-* [Delta-V](https://www.rfc-editor.org/rfc/rfc3253)
+* [Delta-V](https://www.rfc-editor.org/rfc/rfc3253) — inspiration only; the RFC 3253 protocol is deliberately not implemented (no client ecosystem — see `docs/specs/0001-initial-build-plan.md`)
 * [WebDAV Search](https://www.rfc-editor.org/rfc/rfc5323)
 * [awesome-webdav](https://github.com/fstanis/awesome-webdav)

@@ -73,9 +73,10 @@ without dragging WebDAV along.
   chunks are shared. Model version history in the metadata store.
 - Expose history pragmatically — a virtual `.versions/` namespace and/or an
   HTTP endpoint — since `dav-server` won't route Delta-V methods.
-- **Full RFC 3253 protocol compliance (`VERSION-CONTROL`, `REPORT`,
-  `CHECKOUT`/`CHECKIN`) is deferred to later phases**, layered onto the outer
-  router incrementally once basic auto-versioning is solid.
+- **Full RFC 3253 (Delta-V) protocol compliance (`VERSION-CONTROL`, `REPORT`,
+  `CHECKOUT`/`CHECKIN`) is _not_ pursued** — see Resolved decision #4. Versioning
+  is delivered through the web UI and the `?versions` / `?version=N` / revert /
+  prune endpoints instead.
 
 ### Phase 4 — Browser layer / content negotiation (in the router)
 - Detect browser vs. WebDAV client by `Accept: text/html`. `GET` `.md` → HTML via
@@ -102,6 +103,18 @@ without dragging WebDAV along.
    _Resolved 2026-07-02._
 2. **Search engine** (Phase 5): **`tantivy`.** Full-featured and promising; worth
    the dependency over a hand-rolled inverted index. _Resolved 2026-07-02._
-3. **Versioning scope** (Phase 3): **Basic auto-versioning first**, with
-   additional Delta-V (RFC 3253) protocol functionality delivered in later phases.
-   _Resolved 2026-07-02._
+3. **Versioning scope** (Phase 3): **Basic auto-versioning first**, with the
+   history surfaced through the web UI and simple HTTP endpoints (superseded on
+   the Delta-V question by decision #4). _Resolved 2026-07-02._
+4. **Delta-V (RFC 3253) not pursued**: the auto-versioning capability is
+   delivered, but the RFC 3253 *protocol* (the `VERSION-CONTROL` / `CHECKOUT` /
+   `CHECKIN` / `REPORT` method set and its live properties) is deliberately not
+   implemented. There is effectively **no client ecosystem** for Delta-V —
+   general-purpose WebDAV clients (Finder, the Windows mini-redirector, `rclone`,
+   `davfs2`, `cadaver`) are class-1/2 only, and the one notable deployment
+   (Subversion's `mod_dav_svn`) was an SVN-specific derivation, not a target for
+   generic clients. Implementing it would be write-only interop: we'd have to
+   author our own client just to exercise it, for zero real-world reach. Version
+   history is instead delivered via the browser UI and the `?versions` /
+   `?version=N` / `?revert` / `?prune` endpoints. RFC 3253 remains a reference/
+   inspiration only. _Resolved 2026-07-06._
