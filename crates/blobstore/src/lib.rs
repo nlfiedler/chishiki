@@ -119,6 +119,16 @@ impl BlobStore {
             fs::create_dir_all(parent)?;
         }
         temp.as_file().sync_all()?;
+        // `NamedTempFile` creates the temp file at 0o600, and `persist` preserves
+        // that mode. Widen it to 0o644 so the blob is world-readable — e.g. a
+        // backup process running as another user can read it. (Blobs are
+        // immutable once committed, so only read access matters.)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            temp.as_file()
+                .set_permissions(fs::Permissions::from_mode(0o644))?;
+        }
         // Atomic on the same filesystem. If a concurrent writer beat us to it,
         // the content is identical, so treat an existing destination as success.
         if let Err(err) = temp.persist(&dest)
@@ -266,6 +276,21 @@ mod tests {
     /// Count the committed blobs under the store root (via the production scan).
     fn count_blobs(store: &BlobStore) -> usize {
         store.list_hashes().unwrap().len()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committed_blob_is_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, store) = temp_store();
+        let hash = store.put(b"hello").unwrap();
+        // `NamedTempFile` defaults to 0o600; commit must widen the blob to 0o644
+        // so a backup process running as another user can read it.
+        let mode = fs::metadata(store.blob_path(&hash))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o644);
     }
 
     #[test]
