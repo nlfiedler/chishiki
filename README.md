@@ -5,6 +5,8 @@ Basic WebDAV server with file auto-versioning, WebDAV Search, and a simple web i
 ## Features
 
 * When accessed with a browser, renders Markdown, displays images and videos.
+  Markdown rendering supports CommonMark plus tables, strikethrough, task
+  lists, and footnotes.
 * Records multiple versions of each file with controls for reverting.
 * Maintains a reverse index for searching textual files by query terms.
 
