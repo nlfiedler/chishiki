@@ -179,6 +179,15 @@ async fn handle_browser_get(
     if has_raw(query) {
         return None;
     }
+    // `?print` serves a standalone, chrome-free page (no sidebar, no
+    // Download/History/Print buttons) with just the rendered content, for a
+    // browser's own Print command to produce clean output.
+    if has_print(query) {
+        return Some(match DavPath::new(path_str) {
+            Ok(path) => print_page_response(fs, &path).await,
+            Err(_) => bad_request("bad path"),
+        });
+    }
     // `?q=…` is a full-text search scoped to this path's subtree (root = global).
     if let Some(q) = parse_search_query(query) {
         return Some(search_response(fs, path_str, &q, accept_html).await);
@@ -244,6 +253,19 @@ async fn file_page(fs: &DavFs, path: &DavPath, path_str: &str) -> Response {
     let sidebar = parent_sidebar(fs, path_str, &name);
     let main = web::file_main(&name, kind, content.as_deref());
     html_response(web::page(&name, &sidebar, &main))
+}
+
+/// `GET /file?print` → the standalone print page (see [`web::print_page`]).
+/// Only defined for the kinds `file_main` renders inline as text (Markdown/Text);
+/// other kinds (images, PDFs, …) have no chrome to strip, so this 404s.
+async fn print_page_response(fs: &DavFs, path: &DavPath) -> Response {
+    let name = basename(path);
+    let kind = web::file_kind(&name);
+    if !kind.reads_text() {
+        return not_found();
+    }
+    let content = read_inline(fs, path.clone(), kind).await;
+    html_response(web::print_page(&name, kind, content.as_deref()))
 }
 
 /// Handle a state-changing `POST`: `?revert=N` / `?prune=N` (per-file) or `?gc`
@@ -815,6 +837,14 @@ fn has_raw(query: &str) -> bool {
     query
         .split('&')
         .any(|p| p == "raw" || p.starts_with("raw="))
+}
+
+/// Whether the query string carries the `print` selector (serve the standalone
+/// print page instead of the normal two-pane view).
+fn has_print(query: &str) -> bool {
+    query
+        .split('&')
+        .any(|p| p == "print" || p.starts_with("print="))
 }
 
 /// Whether a name is a directory's index document (rendered into the main pane).

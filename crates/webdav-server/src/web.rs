@@ -250,13 +250,51 @@ pub(crate) fn file_main(name: &str, kind: FileKind, text: Option<&str>) -> Strin
         }
         FileKind::Other => no_preview(),
     };
-    format!("{}{body}", file_header(name))
+    format!("{}{body}", file_header(name, kind.reads_text()))
 }
 
 /// "No preview" notice with a nudge to the Download button.
 fn no_preview() -> String {
     "<p class=\"notification\">No inline preview for this file — use Download above.</p>"
         .to_string()
+}
+
+/// Standalone, chrome-free page for `?print`: just the title and rendered
+/// content, no sidebar and no Download/History/Print buttons — so a browser's
+/// own Print command produces clean output without them. A `window.print()`
+/// button is included for convenience and hides itself via `@media print`.
+///
+/// `text` mirrors [`file_main`]'s convention (`Some` = rendered Markdown HTML or
+/// raw text-to-be-escaped, `None` = unreadable/oversized).
+pub(crate) fn print_page(name: &str, kind: FileKind, text: Option<&str>) -> String {
+    let title = escape_html(name);
+    let body = match kind {
+        FileKind::Markdown => match text {
+            Some(html) => format!("<div class=\"content\">{html}</div>"),
+            None => no_preview(),
+        },
+        FileKind::Text => match text {
+            Some(content) => format!("<pre>{}</pre>", escape_html(content)),
+            None => no_preview(),
+        },
+        _ => no_preview(),
+    };
+    format!(
+        "<!doctype html>\n\
+         <html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>{title}</title>\
+         <link rel=\"stylesheet\" href=\"/_assets/bulma.css\">\
+         <style>{PRINT_CSS}</style></head>\
+         <body><div class=\"print-page\">\
+         <div class=\"level no-print\"><div class=\"level-left\"></div>\
+         <div class=\"level-right\">\
+         <button class=\"button is-small\" onclick=\"window.print()\">Print</button>\
+         </div></div>\
+         <h1 class=\"title is-4\">{title}</h1>\
+         {body}\
+         </div></body></html>"
+    )
 }
 
 /// Version-history main pane: the table with view/revert/delete controls.
@@ -305,13 +343,20 @@ pub(crate) fn version_main(name: &str, versions: &[VersionInfo]) -> String {
     )
 }
 
-/// Header bar for a file's main pane: the name plus Download/History links.
-fn file_header(name: &str) -> String {
+/// Header bar for a file's main pane: the name plus Print (only for the kinds
+/// `?print` supports — rendered Markdown/Text)/Download/History links.
+fn file_header(name: &str, printable: bool) -> String {
     let name = escape_html(name);
+    let print_link = if printable {
+        "<a class=\"button is-small\" href=\"?print\">Print</a>"
+    } else {
+        ""
+    };
     format!(
         "<div class=\"level\"><div class=\"level-left\">\
          <h1 class=\"title is-5\">{name}</h1></div>\
          <div class=\"level-right buttons\">\
+         {print_link}\
          <a class=\"button is-small\" href=\"?raw\" download>Download</a>\
          <a class=\"button is-small\" href=\"?versions\">History</a></div></div>"
     )
@@ -452,3 +497,9 @@ background:var(--bulma-scheme-main-bis)}\
 @media(max-width:768px){.app{flex-direction:column;height:auto}\
 .app-sidebar{width:auto;max-width:none;border-right:none;\
 border-bottom:1px solid var(--bulma-border)}}";
+
+/// CSS for the standalone `?print` page: a single readable column, no sidebar.
+/// The on-page Print button hides itself in the print output (`@media print`).
+const PRINT_CSS: &str = "\
+body{max-width:44rem;margin:0 auto;padding:1.5rem 2rem 4rem}\
+@media print{.no-print{display:none}}";
