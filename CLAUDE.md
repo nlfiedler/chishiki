@@ -39,7 +39,12 @@ used with `default-features = false` (no bundled `localfs`/`memfs`), so we map
 `io::Error`/`MetaError` to `FsError` ourselves (`io_to_fs`/`meta_to_fs`). Writes
 buffer to a temp file under `<data>/tmp` and are chunked into the blob store on
 `flush`; reads stream by reconstructing from the manifest (Range/seek supported,
-with the current chunk cached to keep sequential reads O(n)). Moving/copying a
+with the current chunk cached to keep sequential reads O(n)). `flush` picks the
+chunker config by file name (`Inner::chunker_for`): media (image/video/audio
+extensions, `is_media_name`) uses `ChunkerConfig::media()` (256 KiB / 1 MiB /
+4 MiB) since it rarely dedups; everything else uses the default (16 / 64 /
+256 KiB). Versions record their own chunk lists, so a config change never
+affects already-stored content. Moving/copying a
 collection into its own subtree is rejected (`MetaStore::is_ancestor_or_self`).
 
 **Versioning (Phase 3):** every content write appends an immutable version

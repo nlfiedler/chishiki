@@ -20,6 +20,13 @@ pub const DEFAULT_AVG_SIZE: u32 = 64 * 1024;
 /// Default maximum chunk size: 256 KiB.
 pub const DEFAULT_MAX_SIZE: u32 = 256 * 1024;
 
+/// Minimum chunk size for media content: 256 KiB.
+pub const MEDIA_MIN_SIZE: u32 = 256 * 1024;
+/// Average (target) chunk size for media content: 1 MiB.
+pub const MEDIA_AVG_SIZE: u32 = 1024 * 1024;
+/// Maximum chunk size for media content: 4 MiB.
+pub const MEDIA_MAX_SIZE: u32 = 4 * 1024 * 1024;
+
 /// A single content-defined chunk produced from a stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
@@ -69,6 +76,16 @@ impl ChunkerConfig {
             avg_size,
             max_size,
         })
+    }
+
+    /// Larger chunks (256 KiB / 1 MiB / 4 MiB) for already-compressed media
+    /// (images, video, audio). Such content rarely shares chunks between files
+    /// or revisions, so small chunks buy no deduplication — they only multiply
+    /// the number of blobs to store and to open when streaming the file back.
+    pub fn media() -> Self {
+        // The media sizes are known-valid, so this cannot fail.
+        Self::new(MEDIA_MIN_SIZE, MEDIA_AVG_SIZE, MEDIA_MAX_SIZE)
+            .expect("media chunker sizes are within range")
     }
 
     /// Minimum chunk size in bytes.
@@ -230,6 +247,15 @@ mod tests {
         let cfg = ChunkerConfig::default();
         assert!(cfg.min_size() <= cfg.avg_size());
         assert!(cfg.avg_size() <= cfg.max_size());
+    }
+
+    #[test]
+    fn media_config_is_valid_and_larger_than_default() {
+        let media = ChunkerConfig::media();
+        let default = ChunkerConfig::default();
+        assert!(media.min_size() <= media.avg_size());
+        assert!(media.avg_size() <= media.max_size());
+        assert!(media.avg_size() > default.avg_size());
     }
 
     #[test]

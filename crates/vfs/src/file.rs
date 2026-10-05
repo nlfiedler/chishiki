@@ -309,9 +309,11 @@ impl DavFile for FileHandle {
                         let modified = {
                             let _gc = inner.gc_lock.read().unwrap_or_else(|e| e.into_inner());
                             let file = std::fs::File::open(&path).map_err(io_to_fs)?;
+                            // Media gets larger chunks; pick by the node's name.
+                            let node = inner.meta.get_node(node_id).map_err(meta_to_fs)?;
                             let manifest = inner
                                 .blobs
-                                .store_file(&file, inner.chunker)
+                                .store_file(&file, inner.chunker_for(&node.name))
                                 .map_err(io_to_fs)?;
                             inner
                                 .meta

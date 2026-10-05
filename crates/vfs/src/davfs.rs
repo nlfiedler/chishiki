@@ -30,6 +30,8 @@ pub(crate) struct Inner {
     pub(crate) meta: MetaStore,
     pub(crate) blobs: BlobStore,
     pub(crate) chunker: ChunkerConfig,
+    /// Larger-chunk configuration for media files (see [`Inner::chunker_for`]).
+    pub(crate) media_chunker: ChunkerConfig,
     /// Full-text reverse index over indexable file content (Phase 5).
     pub(crate) index: SearchIndex,
     /// Coordinates blob garbage collection with content writes (Phase 6).
@@ -110,6 +112,20 @@ impl Inner {
         self.index.index_document(node_id as u64, &text)?;
         self.index.commit()?;
         Ok(())
+    }
+
+    /// The chunker configuration for content written to a file named `name`:
+    /// larger chunks for media (see [`is_media_name`]), the default otherwise.
+    ///
+    /// This only decides how *new* content is split. A stored version records
+    /// its own chunk list, so versions written under a different configuration
+    /// stay readable as they are.
+    pub(crate) fn chunker_for(&self, name: &[u8]) -> ChunkerConfig {
+        if is_media_name(name) {
+            self.media_chunker
+        } else {
+            self.chunker
+        }
     }
 
     /// Reference an already-stored manifest as `node_id`'s new content, holding
@@ -198,6 +214,49 @@ fn is_indexable_name(name: &[u8]) -> bool {
     )
 }
 
+/// Whether a file name looks like compressed media (image, video, or audio) by
+/// extension. Such content is chunked with the larger media configuration: it
+/// rarely deduplicates, so small chunks only add blobs.
+fn is_media_name(name: &[u8]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let ext = match lower.rsplit(|&b| b == b'.').next() {
+        Some(e) if e.len() < lower.len() => e,
+        _ => return false,
+    };
+    matches!(
+        ext,
+        // Images.
+        b"png"
+            | b"jpg"
+            | b"jpeg"
+            | b"gif"
+            | b"webp"
+            | b"avif"
+            | b"heic"
+            | b"heif"
+            | b"bmp"
+            | b"ico"
+            | b"tif"
+            | b"tiff"
+            // Video.
+            | b"mp4"
+            | b"m4v"
+            | b"webm"
+            | b"mov"
+            | b"mkv"
+            | b"ogv"
+            | b"avi"
+            // Audio.
+            | b"mp3"
+            | b"wav"
+            | b"ogg"
+            | b"opus"
+            | b"flac"
+            | b"m4a"
+            | b"aac"
+    )
+}
+
 /// A `dav-server` filesystem backed by the SQLite metadata store and the
 /// content-addressable blob store.
 ///
@@ -235,6 +294,7 @@ impl DavFs {
                 blobs,
                 index,
                 chunker: ChunkerConfig::default(),
+                media_chunker: ChunkerConfig::media(),
                 gc_lock: std::sync::RwLock::new(()),
                 tmp_dir,
             }),
@@ -1549,6 +1609,41 @@ mod tests {
         // Delete it: dropped from results.
         fs.remove_file(&dp("/moved.md")).await.unwrap();
         assert!(fs.search("badgers", 10, &dp("/")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn is_media_name_matches_media_extensions_only() {
+        assert!(is_media_name(b"photo.png"));
+        assert!(is_media_name(b"Clip.MP4")); // case-insensitive
+        assert!(is_media_name(b"song.flac"));
+        assert!(!is_media_name(b"notes.md"));
+        assert!(!is_media_name(b"paper.pdf"));
+        assert!(!is_media_name(b"mp4")); // no extension
+        assert!(!is_media_name(b"README"));
+    }
+
+    #[tokio::test]
+    async fn media_files_are_stored_in_larger_chunks() {
+        let (_dir, fs) = temp_fs();
+        let data = pseudo_random(8 * 1024 * 1024, 7);
+        write_file(&fs, "/clip.mp4", &data).await;
+        write_file(&fs, "/data.bin", &data).await;
+
+        let manifest = |path: &str| {
+            let node = fs.resolve(&dp(path)).unwrap();
+            fs.inner.meta.load_manifest(node.id).unwrap()
+        };
+        let media = manifest("/clip.mp4");
+        let plain = manifest("/data.bin");
+
+        // Every media chunk but the last respects the media minimum, so the
+        // same bytes land in far fewer chunks than under the default config.
+        let (_, full) = media.chunks.split_last().unwrap();
+        assert!(full.iter().all(|c| c.length >= chunker::MEDIA_MIN_SIZE));
+        assert!(media.chunks.len() * 4 < plain.chunks.len());
+
+        // Chunking differs; the content does not.
+        assert_eq!(read_file(&fs, "/clip.mp4").await, data);
     }
 
     #[test]
