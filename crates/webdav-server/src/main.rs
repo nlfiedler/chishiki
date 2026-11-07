@@ -578,24 +578,25 @@ fn parse_search_request(body: &[u8]) -> SearchRequest {
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => match local_name(e.name().as_ref()) {
-                b"contains" => in_contains = true,
-                b"literal" => in_literal = true,
-                b"scope" => in_scope = true,
-                b"href" if in_scope => in_href = true,
+            Ok(Event::Start(e)) => match e.name().local_name().as_ref() {
+                "contains" => in_contains = true,
+                "literal" => in_literal = true,
+                "scope" => in_scope = true,
+                "href" if in_scope => in_href = true,
                 _ => {}
             },
-            Ok(Event::End(e)) => match local_name(e.name().as_ref()) {
-                b"contains" => in_contains = false,
-                b"literal" => in_literal = false,
-                b"scope" => in_scope = false,
-                b"href" => in_href = false,
+            Ok(Event::End(e)) => match e.name().local_name().as_ref() {
+                "contains" => in_contains = false,
+                "literal" => in_literal = false,
+                "scope" => in_scope = false,
+                "href" => in_href = false,
                 _ => {}
             },
             Ok(Event::Text(t)) => {
-                // `decode()` yields the literal text; entity references arrive as
-                // separate events (ignored — search terms rarely contain them).
-                let text = t.decode().unwrap_or_default();
+                // The literal text (XML 1.0 EOL-normalized); entity references
+                // arrive as separate events (ignored — search terms rarely
+                // contain them).
+                let text = t.xml10_content();
                 if in_contains {
                     contains.push_str(&text);
                 } else if in_literal {
@@ -621,14 +622,6 @@ fn parse_search_request(body: &[u8]) -> SearchRequest {
         (!s.is_empty()).then(|| s.to_string())
     };
     SearchRequest { query, scope_href }
-}
-
-/// The local part of an XML element name (drop any `prefix:`).
-fn local_name(qname: &[u8]) -> &[u8] {
-    match qname.iter().rposition(|&b| b == b':') {
-        Some(i) => &qname[i + 1..],
-        None => qname,
-    }
 }
 
 /// Reduce a scope `href` (an absolute path or full URL) to a URL path for
@@ -990,12 +983,6 @@ mod tests {
         // A bare authority with no path defaults to root.
         assert_eq!(href_to_path("http://host").as_deref(), Some("/"));
         assert_eq!(href_to_path("   "), None);
-    }
-
-    #[test]
-    fn local_name_drops_prefix() {
-        assert_eq!(local_name(b"D:contains"), b"contains");
-        assert_eq!(local_name(b"contains"), b"contains");
     }
 
     #[test]

@@ -53,16 +53,24 @@ pub struct ChunkerConfig {
 
 impl ChunkerConfig {
     /// Create a configuration, validating that each size is within the range
-    /// FastCDC accepts and that `min_size <= avg_size <= max_size`.
+    /// FastCDC accepts, is even (the v2020 scan tests cut candidates in byte
+    /// pairs, so an odd size would silently shift its boundaries), and that
+    /// `min_size <= avg_size <= max_size`.
     pub fn new(min_size: u32, avg_size: u32, max_size: u32) -> Result<Self, ConfigError> {
-        if !(MINIMUM_MIN..=MINIMUM_MAX).contains(&min_size) {
+        if !(MINIMUM_MIN..=MINIMUM_MAX).contains(&(min_size as usize)) {
             return Err(ConfigError::MinOutOfRange(min_size));
         }
-        if !(AVERAGE_MIN..=AVERAGE_MAX).contains(&avg_size) {
+        if !(AVERAGE_MIN..=AVERAGE_MAX).contains(&(avg_size as usize)) {
             return Err(ConfigError::AvgOutOfRange(avg_size));
         }
-        if !(MAXIMUM_MIN..=MAXIMUM_MAX).contains(&max_size) {
+        if !(MAXIMUM_MIN..=MAXIMUM_MAX).contains(&(max_size as usize)) {
             return Err(ConfigError::MaxOutOfRange(max_size));
+        }
+        if let Some(odd) = [min_size, avg_size, max_size]
+            .into_iter()
+            .find(|v| v % 2 != 0)
+        {
+            return Err(ConfigError::Odd(odd));
         }
         if !(min_size <= avg_size && avg_size <= max_size) {
             return Err(ConfigError::NotAscending {
@@ -121,6 +129,8 @@ pub enum ConfigError {
     AvgOutOfRange(u32),
     /// `max_size` is outside the range FastCDC accepts.
     MaxOutOfRange(u32),
+    /// A size is odd; FastCDC v2020 requires even sizes.
+    Odd(u32),
     /// The sizes are not ordered `min <= avg <= max`.
     NotAscending { min: u32, avg: u32, max: u32 },
 }
@@ -140,6 +150,7 @@ impl fmt::Display for ConfigError {
                 f,
                 "maximum chunk size {v} out of range [{MAXIMUM_MIN}, {MAXIMUM_MAX}]"
             ),
+            Self::Odd(v) => write!(f, "chunk size {v} must be even"),
             Self::NotAscending { min, avg, max } => write!(
                 f,
                 "chunk sizes must satisfy min <= avg <= max, got {min} / {avg} / {max}"
@@ -159,7 +170,13 @@ pub fn chunk_reader<R: Read>(
     reader: R,
     config: ChunkerConfig,
 ) -> impl Iterator<Item = io::Result<Chunk>> {
-    StreamCDC::new(reader, config.min_size, config.avg_size, config.max_size).map(|result| {
+    StreamCDC::new(
+        reader,
+        config.min_size as usize,
+        config.avg_size as usize,
+        config.max_size as usize,
+    )
+    .map(|result| {
         result
             .map(|cd| Chunk {
                 offset: cd.offset,
@@ -269,5 +286,47 @@ mod tests {
             ChunkerConfig::new(DEFAULT_MAX_SIZE, DEFAULT_AVG_SIZE, DEFAULT_MAX_SIZE),
             Err(ConfigError::NotAscending { .. })
         ));
+    }
+
+    #[test]
+    fn config_rejects_odd_sizes() {
+        assert_eq!(
+            ChunkerConfig::new(DEFAULT_MIN_SIZE, DEFAULT_AVG_SIZE, 65_535 * 4 + 1),
+            Err(ConfigError::Odd(65_535 * 4 + 1))
+        );
+    }
+
+    /// Pins the cut points for both configs. The expected offsets were produced
+    /// by fastcdc 3.2.1; existing stored content was chunked with it, so a
+    /// fastcdc upgrade that moved boundaries would silently stop new writes
+    /// from deduplicating against old chunks. If this fails after a dependency
+    /// bump, treat it as a storage-format change, not a test to update.
+    #[test]
+    fn cut_points_are_stable_across_fastcdc_versions() {
+        // xorshift64 stream, 3 MiB + 1 byte (an odd-length tail on purpose).
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let data: Vec<u8> = (0..3 * 1024 * 1024 + 1)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 24) as u8
+            })
+            .collect();
+        let offsets = |cfg| -> Vec<u64> {
+            chunk_reader(&data[..], cfg)
+                .map(|c| c.unwrap().offset)
+                .collect()
+        };
+        assert_eq!(
+            offsets(ChunkerConfig::default()),
+            [
+                0, 107373, 127427, 195752, 311878, 394612, 619882, 679019, 768984, 892350, 975777,
+                1040333, 1130485, 1228807, 1278861, 1359743, 1485385, 1583970, 1667192, 1760332,
+                1830309, 1976211, 1995943, 2130695, 2293063, 2400447, 2469512, 2489860, 2567863,
+                2591755, 2646563, 2766743, 2847706, 2876253, 2994026,
+            ]
+        );
+        assert_eq!(offsets(ChunkerConfig::media()), [0, 1040333, 2474732]);
     }
 }

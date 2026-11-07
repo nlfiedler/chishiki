@@ -42,7 +42,7 @@ index = { path = "crates/index" }
 
 # Third-party crates, versions pinned once for the whole workspace.
 blake3 = "1"
-fastcdc = "3"
+fastcdc = "5"
 tempfile = "3"
 # default-features off drops the built-in localfs/memfs backends (and their
 # libc/lru/parking_lot/reflink deps); we supply our own backend but still get
@@ -50,15 +50,15 @@ tempfile = "3"
 dav-server = { version = "0.11", default-features = false }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 bytes = "1"
 futures-util = "0.3"
 pulldown-cmark = "0.13"
 percent-encoding = "2"
 # Full-text search engine backing the reverse index (Phase 5).
-tantivy = "0.26"
+tantivy = "0.27"
 # XML reader for parsing RFC 5323 SEARCH request bodies in the router.
-quick-xml = "0.41"
+quick-xml = "0.42"
 
 [profile.release]
 lto = "thin"
