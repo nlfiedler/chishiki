@@ -12,7 +12,7 @@
 //! callers commit after each mutation so a search reflects the latest content.
 //! tantivy allows only a single writer, so one is held behind a mutex.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 
 use tantivy::collector::TopDocs;
@@ -20,6 +20,9 @@ use tantivy::query::QueryParser;
 use tantivy::schema::{FAST, INDEXED, STORED, Schema, TEXT, Value};
 use tantivy::snippet::SnippetGenerator;
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term, doc};
+
+mod readable_dir;
+use readable_dir::ReadableDirectory;
 
 /// Memory budget (bytes) for the single index writer's indexing arena.
 const WRITER_HEAP_BYTES: usize = 50 * 1024 * 1024;
@@ -30,17 +33,7 @@ pub struct SearchIndex {
     reader: IndexReader,
     writer: Mutex<IndexWriter>,
     fields: Fields,
-    /// On-disk index root, if backed by a directory (`None` for in-memory). Used
-    /// to re-widen tantivy's atomically-rewritten metadata files after a commit.
-    dir: Option<PathBuf>,
 }
-
-/// tantivy metadata files that it rewrites atomically (temp file + rename), which
-/// lands them at 0o600. We widen these to 0o644 after each commit so a backup
-/// process running as another user can read the whole index directory. (The
-/// segment files tantivy writes directly already inherit the umask, 0o644.)
-#[cfg(unix)]
-const WIDEN_AFTER_COMMIT: [&str; 2] = ["meta.json", ".managed.json"];
 
 /// The schema fields, resolved once at open.
 struct Fields {
@@ -111,10 +104,12 @@ impl SearchIndex {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir).map_err(tantivy::TantivyError::from)?;
         let (schema, fields) = build_schema();
-        let mmap =
-            tantivy::directory::MmapDirectory::open(dir).map_err(tantivy::TantivyError::from)?;
+        // Keeps tantivy's atomically-rewritten metadata (`meta.json`,
+        // `.managed.json`) at 0o644 so a backup running as another user can read
+        // the whole index — see `readable_dir`.
+        let directory = ReadableDirectory::open(dir)?;
         // Reuse an existing index in this directory, or create one with our schema.
-        let index = Index::open_or_create(mmap, schema)?;
+        let index = Index::open_or_create(directory, schema)?;
         let reader = index.reader()?;
         let writer = index.writer(WRITER_HEAP_BYTES)?;
         Ok(Self {
@@ -122,7 +117,6 @@ impl SearchIndex {
             reader,
             writer: Mutex::new(writer),
             fields,
-            dir: Some(dir.to_path_buf()),
         })
     }
 
@@ -137,7 +131,6 @@ impl SearchIndex {
             reader,
             writer: Mutex::new(writer),
             fields,
-            dir: None,
         })
     }
 
@@ -174,28 +167,8 @@ impl SearchIndex {
         // Refresh the reader so subsequent searches see the committed state
         // immediately (deterministic, rather than waiting on the reload policy).
         self.reader.reload()?;
-        self.widen_metadata_files();
         Ok(())
     }
-
-    /// Re-widen tantivy's atomically-rewritten metadata files to 0o644 after a
-    /// commit rewrote them at 0o600. Best-effort: a chmod failure (e.g. the file
-    /// isn't present yet) is silently ignored — permissions are not correctness.
-    #[cfg(unix)]
-    fn widen_metadata_files(&self) {
-        use std::os::unix::fs::PermissionsExt;
-        if let Some(dir) = &self.dir {
-            for name in WIDEN_AFTER_COMMIT {
-                let _ = std::fs::set_permissions(
-                    dir.join(name),
-                    std::fs::Permissions::from_mode(0o644),
-                );
-            }
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn widen_metadata_files(&self) {}
 
     /// Run `query` against the body field, returning up to `limit` hits ordered
     /// by descending relevance.
@@ -313,20 +286,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn commit_widens_metadata_files() {
+    fn metadata_files_stay_readable_after_commit_and_merge() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let idx = SearchIndex::open(dir.path()).unwrap();
+        // Two commits -> two segments, then force a merge: tantivy rewrites
+        // `meta.json` and `.managed.json` atomically (at 0o600 by default) both
+        // on commit and on the merge path, so all of them must end up 0o644 for
+        // a backup running as another user to read the index.
         idx.index_document(1, "some body text").unwrap();
         idx.commit().unwrap();
-        // tantivy rewrites these atomically at 0o600 on each commit; commit must
-        // re-widen them to 0o644 so the whole index dir stays backup-readable.
-        for name in WIDEN_AFTER_COMMIT {
+        idx.index_document(2, "more body text").unwrap();
+        idx.commit().unwrap();
+        let segments = idx.index.searchable_segment_ids().unwrap();
+        assert!(segments.len() >= 2, "expected multiple segments to merge");
+        idx.writer().merge(&segments).wait().unwrap();
+        assert_eq!(idx.index.searchable_segment_ids().unwrap().len(), 1);
+        for name in ["meta.json", ".managed.json"] {
             let mode = std::fs::metadata(dir.path().join(name))
                 .unwrap()
                 .permissions()
                 .mode();
-            assert_eq!(mode & 0o777, 0o644, "{name} was not widened");
+            assert_eq!(mode & 0o777, 0o644, "{name} is not world-readable");
         }
     }
 }
